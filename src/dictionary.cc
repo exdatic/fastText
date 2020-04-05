@@ -123,9 +123,6 @@ void Dictionary::getSubwords(
 bool Dictionary::discard(int32_t id, real rand) const {
   assert(id >= 0);
   assert(id < nwords_);
-  if (args_->model == model_name::sup) {
-    return false;
-  }
   return rand > pdiscard_[id];
 }
 

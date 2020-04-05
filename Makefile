@@ -11,7 +11,7 @@ CXXFLAGS = -pthread -std=c++11 -march=native
 OBJS = args.o autotune.o matrix.o dictionary.o loss.o productquantizer.o densematrix.o quantmatrix.o vector.o model.o utils.o meter.o fasttext.o
 INCLUDES = -I.
 
-opt: CXXFLAGS += -O3 -funroll-loops -DNDEBUG
+opt: CXXFLAGS += -Ofast -funroll-loops -DNDEBUG
 opt: fasttext
 
 coverage: CXXFLAGS += -O0 -fno-inline -fprofile-arcs --coverage

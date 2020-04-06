@@ -432,6 +432,36 @@ void FastText::skipgram(
   }
 }
 
+void FastText::pvdm(
+    Model::State& state, 
+    real lr,
+    const std::vector<int32_t>& line,
+    const std::vector<int32_t>& hashes,
+    const std::vector<int32_t>& labels) {
+  if (line.size() == 0) return;
+  std::vector<int32_t> bow, boh;
+  std::uniform_int_distribution<> uniform(1, args_->ws);
+  std::uniform_int_distribution<> uniformLabels(0, labels.size() - 1);
+  for (int32_t w = 0; w < line.size(); w++) {
+    int32_t boundary = uniform(state.rng);
+    bow.clear();
+    boh.clear();
+    for (int32_t c = -boundary; c <= boundary; c++) {
+      if (c != 0 && w + c >= 0 && w + c < line.size()) {
+        const std::vector<int32_t>& ngrams = dict_->getSubwords(line[w + c]);
+        bow.insert(bow.end(), ngrams.cbegin(), ngrams.cend());
+        boh.insert(boh.end(), hashes[w + c]);
+      }
+    }
+    dict_->addWordNgrams(bow, boh, args_->wordNgrams);
+    if (labels.size() > 0) {
+      int32_t i = uniformLabels(state.rng);
+      bow.insert(bow.end(), labels[i] + dict_->nwords() + args_->bucket);
+    }
+    model_->update(bow, line, w, lr, state);
+  }
+}
+
 std::tuple<int64_t, double, double>
 FastText::test(std::istream& in, int32_t k, real threshold) {
   Meter meter;
@@ -670,6 +700,9 @@ void FastText::trainThread(int32_t threadId) {
       } else if (args_->model == model_name::sg) {
         localTokenCount += dict_->getLine(ifs, line, state.rng);
         skipgram(state, lr, line);
+      } else if (args_->model == model_name::pvdm) {
+        localTokenCount += dict_->getLine(ifs, line, hashes, labels, state.rng, Dictionary::SKIP_EOS | Dictionary::SKIP_LNG | Dictionary::SKIP_OOV | Dictionary::SKIP_FRQ);
+        pvdm(state, lr, line, hashes, labels);
       }
       if (localTokenCount > args_->lrUpdateRate) {
         tokenCount_ += localTokenCount;

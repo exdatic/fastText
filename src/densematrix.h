@@ -8,13 +8,13 @@
 
 #pragma once
 
-#include <assert.h>
 #include <cstdint>
 #include <istream>
 #include <ostream>
-#include <stdexcept>
 #include <vector>
+#include <memory>
 
+#include <assert.h>
 #include "matrix.h"
 #include "real.h"
 
@@ -24,13 +24,13 @@ class Vector;
 
 class DenseMatrix : public Matrix {
  protected:
-  std::vector<real> data_;
-  void uniformThread(real, int, int32_t);
+  std::shared_ptr<std::vector<real>> data_;
+  int64_t offs_ = 0;
 
  public:
   DenseMatrix();
   explicit DenseMatrix(int64_t, int64_t);
-  explicit DenseMatrix(int64_t m, int64_t n, real* dataPtr);
+  DenseMatrix(int64_t, int64_t, DenseMatrix&, int64_t);
   DenseMatrix(const DenseMatrix&) = default;
   DenseMatrix(DenseMatrix&&) noexcept;
   DenseMatrix& operator=(const DenseMatrix&) = delete;
@@ -38,20 +38,23 @@ class DenseMatrix : public Matrix {
   virtual ~DenseMatrix() noexcept override = default;
 
   inline real* data() {
-    return data_.data();
+    return data_->data();
   }
   inline const real* data() const {
-    return data_.data();
+    return data_->data();
   }
 
   inline const real& at(int64_t i, int64_t j) const {
-    assert(i * n_ + j < data_.size());
-    return data_[i * n_ + j];
+    assert(offs_ + i * n_ + j < data_.size());
+    return (*data_)[offs_ + i * n_ + j];
   };
   inline real& at(int64_t i, int64_t j) {
-    return data_[i * n_ + j];
+    return (*data_)[offs_ + i * n_ + j];
   };
 
+  inline int64_t offs() const {
+    return offs_;
+  }
   inline int64_t rows() const {
     return m_;
   }
@@ -59,7 +62,7 @@ class DenseMatrix : public Matrix {
     return n_;
   }
   void zero();
-  void uniform(real, unsigned int, int32_t);
+  void uniform(real);
 
   void multiplyRow(const Vector& nums, int64_t ib = 0, int64_t ie = -1);
   void divideRow(const Vector& denoms, int64_t ib = 0, int64_t ie = -1);
@@ -68,18 +71,11 @@ class DenseMatrix : public Matrix {
   void l2NormRow(Vector& norms) const;
 
   real dotRow(const Vector&, int64_t) const override;
-  void setRowToMatrix(int64_t, Matrix&, int64_t) override;
-  void setVectorToRow(const Vector&, int64_t) override;
   void addVectorToRow(const Vector&, int64_t, real) override;
   void addRowToVector(Vector& x, int32_t i) const override;
   void addRowToVector(Vector& x, int32_t i, real a) const override;
   void save(std::ostream&) const override;
   void load(std::istream&) override;
   void dump(std::ostream&) const override;
-
-  class EncounteredNaNError : public std::runtime_error {
-   public:
-    EncounteredNaNError() : std::runtime_error("Encountered NaN.") {}
-  };
 };
 } // namespace fasttext

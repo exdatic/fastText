@@ -89,6 +89,8 @@ std::string Args::modelToString(model_name mn) const {
       return "sup";
     case model_name::sent2vec:
       return "sent2vec";
+    case model_name::pvdm:
+      return "pvdm";
   }
   return "Unknown model name!"; // should never happen
 }
@@ -131,6 +133,8 @@ void Args::parseArgs(const std::vector<std::string>& args) {
     dropoutK = 2;
   } else if (command == "cbow") {
     model = model_name::cbow;
+  } else if (command == "pvdm") {
+    model = model_name::pvdm;
   }
   for (int ai = 2; ai < args.size(); ai += 2) {
     if (args[ai][0] != '-') {

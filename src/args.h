@@ -50,6 +50,8 @@ class Args {
   std::string label;
   int verbose;
   std::string pretrainedVectors;
+  std::string pretrainedModel;
+  bool incremental;
   bool saveOutput;
   int seed;
 

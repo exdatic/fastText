@@ -37,8 +37,10 @@ Args::Args() {
   label = "__label__";
   verbose = 2;
   pretrainedVectors = "";
+  pretrainedModel = "";
   saveOutput = false;
   seed = 0;
+  incremental = false;
 
   qout = false;
   retrain = false;
@@ -183,6 +185,11 @@ void Args::parseArgs(const std::vector<std::string>& args) {
         verbose = std::stoi(args.at(ai + 1));
       } else if (args[ai] == "-pretrainedVectors") {
         pretrainedVectors = std::string(args.at(ai + 1));
+      } else if (args[ai] == "-pretrainedModel") {
+        pretrainedModel = std::string(args.at(ai + 1));
+      } else if (args[ai] == "-incremental") {
+        incremental = true;
+        ai--;
       } else if (args[ai] == "-saveOutput") {
         saveOutput = true;
         ai--;
@@ -286,6 +293,10 @@ void Args::printTrainingHelp() {
       << "  -pretrainedVectors  pretrained word vectors for supervised "
          "learning ["
       << pretrainedVectors << "]\n"
+      << "  -pretrainedModel    pretrained model ["
+      << pretrainedModel << "]\n"
+      << "  -incremental        whether training updates or extends a pretrained model ["
+      << boolToString(incremental) << "]\n"
       << "  -saveOutput         whether output params should be saved ["
       << boolToString(saveOutput) << "]\n"
       << "  -seed               random generator seed  [" << seed << "]\n";

@@ -97,7 +97,7 @@ int32_t FastText::getWordId(const std::string& word) const {
 
 int32_t FastText::getSubwordId(const std::string& subword) const {
   int32_t h = dict_->hash(subword) % args_->bucket;
-  return dict_->nwords() + h;
+  return dict_->nwords() + dict_->nlabels() + h;
 }
 
 int32_t FastText::getLabelId(const std::string& label) const {
@@ -122,7 +122,7 @@ void FastText::getWordVector(Vector& vec, const std::string& word) const {
 void FastText::getSubwordVector(Vector& vec, const std::string& subword) const {
   vec.zero();
   int32_t h = dict_->hash(subword) % args_->bucket;
-  h = h + dict_->nwords();
+  h = h + dict_->nwords() + dict_->nlabels();
   addInputVector(vec, h);
 }
 
@@ -481,7 +481,7 @@ bool FastText::predictLine(
   predict(k, words, linePredictions, threshold);
   for (const auto& p : linePredictions) {
     predictions.push_back(
-        std::make_pair(std::exp(p.first), dict_->getLabel(p.second)));
+        std::make_pair(std::exp(p.first), dict_->getLabel(p.second - dict_->nwords())));
   }
 
   return true;
@@ -653,6 +653,9 @@ void FastText::trainThread(int32_t threadId, const TrainCallback& callback) {
       real lr = args_->lr * (1.0 - progress);
       if (args_->model == model_name::sup) {
         localTokenCount += dict_->getLine(ifs, line, labels);
+        for (auto it = labels.begin(); it != labels.end(); ++it) {
+          *it -= dict_->nwords();
+        }
         supervised(state, lr, line, labels);
       } else if (args_->model == model_name::cbow) {
         localTokenCount += dict_->getLine(ifs, line, state.rng);
@@ -707,7 +710,7 @@ std::shared_ptr<Matrix> FastText::getInputMatrixFromFile(
   dict_->threshold(1, 0);
   dict_->init();
   std::shared_ptr<DenseMatrix> input = std::make_shared<DenseMatrix>(
-      dict_->nwords() + args_->bucket, args_->dim);
+      dict_->nwords() + dict_->nlabels() + args_->bucket, args_->dim);
   input->uniform(1.0 / args_->dim, args_->thread, args_->seed);
 
   for (size_t i = 0; i < n; i++) {
@@ -724,7 +727,7 @@ std::shared_ptr<Matrix> FastText::getInputMatrixFromFile(
 
 std::shared_ptr<Matrix> FastText::createRandomMatrix() const {
   std::shared_ptr<DenseMatrix> input = std::make_shared<DenseMatrix>(
-      dict_->nwords() + args_->bucket, args_->dim);
+      dict_->nwords() + dict_->nlabels() + args_->bucket, args_->dim);
   input->uniform(1.0 / args_->dim, args_->thread, args_->seed);
 
   return input;
@@ -732,7 +735,7 @@ std::shared_ptr<Matrix> FastText::createRandomMatrix() const {
 
 std::shared_ptr<Matrix> FastText::createTrainOutputMatrix() const {
   int64_t m =
-      (args_->model == model_name::sup) ? dict_->nlabels() : dict_->nwords();
+      (args_->model == model_name::sup) ? dict_->nlabels() : dict_->nwords() + dict_->nlabels();
   std::shared_ptr<DenseMatrix> output =
       std::make_shared<DenseMatrix>(m, args_->dim);
   output->zero();
@@ -755,12 +758,50 @@ void FastText::train(const Args& args, const TrainCallback& callback) {
   dict_->readFromFile(ifs);
   ifs.close();
 
-  if (!args_->pretrainedVectors.empty()) {
-    input_ = getInputMatrixFromFile(args_->pretrainedVectors);
-  } else {
+  if (!args_->pretrainedModel.empty()) {
+    FastText pretrained;
+    pretrained.loadModel(args_->pretrainedModel);
+    if (pretrained.args_->dim != args_->dim) {
+      throw std::invalid_argument(
+          "Dimension of pretrained model (" + std::to_string(pretrained.args_->dim) +
+          ") does not match dimension (" + std::to_string(args_->dim) + ")!");
+    }
+    if (pretrained.args_->model == model_name::sup) {
+        throw std::invalid_argument(
+            "Supervised models cannot be used as pretrained models");
+    }
+    
+    int32_t existing = dict_->update(pretrained.dict_, args_->incremental);
+    std::cerr << "Pretrained words: " << existing << " updated, " << (dict_->nwords() - existing) << " added" << std::endl;
+
     input_ = createRandomMatrix();
+    output_ = createTrainOutputMatrix();
+    
+    for (int32_t i = 0; i < pretrained.dict_->nwords(); i++) {
+      int32_t k = dict_->getId(pretrained.dict_->getWord(i));
+      if (k >= 0 && k < dict_->nwords()) {
+        pretrained.input_->setRowToMatrix(i, *input_, k);
+        if (args_->model != model_name::sup) {
+          pretrained.output_->setRowToMatrix(i, *output_, k);
+        }
+      }
+    }
+    if (pretrained.args_->bucket == args_->bucket) {
+      for (int32_t i = 0; i < args_->bucket; i++) {
+        pretrained.input_->setRowToMatrix(i + pretrained.dict_->nwords() + pretrained.dict_->nlabels(),
+            *input_, i + dict_->nwords() + dict_->nlabels());
+      }
+    }
+  } else {
+    if (!args_->pretrainedVectors.empty()) {
+      input_ = getInputMatrixFromFile(args_->pretrainedVectors);
+      output_ = createTrainOutputMatrix();
+    } else {
+      input_ = createRandomMatrix();
+      output_ = createTrainOutputMatrix();
+    }
   }
-  output_ = createTrainOutputMatrix();
+
   quant_ = false;
   auto loss = createLoss(output_);
   bool normalizeGradient = (args_->model == model_name::sup);

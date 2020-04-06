@@ -30,6 +30,7 @@ Dictionary::Dictionary(std::shared_ptr<Args> args)
       nwords_(0),
       nlabels_(0),
       ntokens_(0),
+      ncounts_(0),
       pruneidx_size_(-1) {}
 
 Dictionary::Dictionary(std::shared_ptr<Args> args, std::istream& in)
@@ -38,6 +39,7 @@ Dictionary::Dictionary(std::shared_ptr<Args> args, std::istream& in)
       nwords_(0),
       nlabels_(0),
       ntokens_(0),
+      ncounts_(0),
       pruneidx_size_(-1) {
   load(in);
 }
@@ -58,6 +60,7 @@ int32_t Dictionary::find(const std::string& w, uint32_t h) const {
 void Dictionary::add(const std::string& w) {
   int32_t h = find(w);
   ntokens_++;
+  ncounts_++;
   if (word2int_[h] == -1) {
     entry e;
     e.word = w;
@@ -231,6 +234,37 @@ bool Dictionary::readWord(std::istream& in, std::string& word) const {
   return !word.empty();
 }
 
+int32_t Dictionary::update(std::shared_ptr<Dictionary> dict, bool incremental) {
+  int32_t existing = 0;
+  for (int32_t i = 0; i < dict->nwords_; i++) {
+    const std::string& w = dict->words_[i].word;
+    int32_t c = dict->words_[i].count;
+    int32_t h = find(w);
+    if (word2int_[h] == -1) {
+      entry e;
+      e.word = w;
+      e.count = c;
+      e.type = getType(w);
+      words_.push_back(e);
+      word2int_[h] = size_++;
+      ncounts_ += c;
+    } else {
+      entry &e = words_[word2int_[h]];
+      if (incremental) {
+        e.count += c;
+        ncounts_++;
+      }
+      existing++;
+    }
+  }
+  
+  threshold(args_->minCount, args_->minCountLabel);
+  initTableDiscard();
+  initNgrams();
+
+  return existing;
+}
+
 void Dictionary::readFromFile(std::istream& in) {
   std::string word;
   int64_t minThreshold = 1;
@@ -294,7 +328,7 @@ void Dictionary::threshold(int64_t t, int64_t tl) {
 void Dictionary::initTableDiscard() {
   pdiscard_.resize(size_);
   for (size_t i = 0; i < size_; i++) {
-    real f = real(words_[i].count) / real(ntokens_);
+    real f = real(words_[i].count) / real(ncounts_);
     pdiscard_[i] = std::sqrt(args_->t / f) + args_->t / f;
   }
 }
@@ -396,7 +430,7 @@ int32_t Dictionary::getLine(
       addSubwords(words, token, wid);
       word_hashes.push_back(h);
     } else if (type == entry_type::label && wid >= 0) {
-      labels.push_back(wid - nwords_);
+      labels.push_back(wid);
     }
     if (token == EOS) {
       break;
@@ -417,7 +451,7 @@ void Dictionary::pushHash(std::vector<int32_t>& hashes, int32_t id) const {
       return;
     }
   }
-  hashes.push_back(nwords_ + id);
+  hashes.push_back(nwords_ + nlabels_ + id);
 }
 
 std::string Dictionary::getLabel(int32_t lid) const {
@@ -490,7 +524,7 @@ void Dictionary::init() {
 void Dictionary::prune(std::vector<int32_t>& idx) {
   std::vector<int32_t> words, ngrams;
   for (auto it = idx.cbegin(); it != idx.cend(); ++it) {
-    if (*it < nwords_) {
+    if (*it < nwords_ + nlabels_) {
       words.push_back(*it);
     } else {
       ngrams.push_back(*it);
@@ -502,7 +536,7 @@ void Dictionary::prune(std::vector<int32_t>& idx) {
   if (ngrams.size() != 0) {
     int32_t j = 0;
     for (const auto ngram : ngrams) {
-      pruneidx_[ngram - nwords_] = j;
+      pruneidx_[ngram - nwords_ - nlabels_] = j;
       j++;
     }
     idx.insert(idx.end(), ngrams.begin(), ngrams.end());

@@ -60,6 +60,7 @@ class Args {
   std::string pretrainedModel;
   bool incremental;
   bool saveOutput;
+  bool saveVectors;
   int seed;
 
   bool qout;

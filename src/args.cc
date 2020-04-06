@@ -39,6 +39,7 @@ Args::Args() {
   pretrainedVectors = "";
   pretrainedModel = "";
   saveOutput = false;
+  saveVectors = false;
   seed = 0;
   incremental = false;
 
@@ -195,6 +196,9 @@ void Args::parseArgs(const std::vector<std::string>& args) {
         ai--;
       } else if (args[ai] == "-seed") {
         seed = std::stoi(args.at(ai + 1));
+      } else if (args[ai] == "-saveVectors") {
+        saveVectors = true;
+        ai--;
       } else if (args[ai] == "-qnorm") {
         qnorm = true;
         ai--;
@@ -299,6 +303,8 @@ void Args::printTrainingHelp() {
       << boolToString(incremental) << "]\n"
       << "  -saveOutput         whether output params should be saved ["
       << boolToString(saveOutput) << "]\n"
+      << "  -saveVectors        whether vectors should be saved ["
+      << boolToString(saveVectors) << "]\n"
       << "  -seed               random generator seed  [" << seed << "]\n";
 }
 

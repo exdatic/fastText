@@ -440,6 +440,60 @@ int32_t Dictionary::getLine(
   return ntokens;
 }
 
+int32_t Dictionary::getLine(
+    std::istream& in,
+    std::vector<int32_t>& words,
+    std::vector<int32_t>& word_hashes,
+    std::vector<int32_t>& labels,
+    std::minstd_rand& rng,
+    int32_t flags) const {
+  std::uniform_real_distribution<> uniform(0, 1);
+  std::string token;
+  int32_t ntokens = 0;
+
+  reset(in);
+  words.clear();
+  word_hashes.clear();
+  labels.clear();
+  while (readWord(in, token)) {
+    if (flags & SKIP_EOS) {
+      if (token == EOS) {
+        break;
+      }
+    }
+    uint32_t h = hash(token);
+    int32_t wid = getId(token, h);
+    if (flags & SKIP_OOV) {
+      if (wid < 0) {
+        continue;
+      }
+    }
+    entry_type type = wid < 0 ? getType(token) : getType(wid);
+
+    ntokens++;
+    if (type == entry_type::word) {
+      if (flags & SKIP_FRQ) {
+        if (discard(wid, uniform(rng))) {
+          continue;
+        }
+      }
+      words.push_back(wid);
+      word_hashes.push_back(h);
+    } else if (type == entry_type::label && wid >= 0) {
+      labels.push_back(wid);
+    }
+    if (flags & SKIP_LNG) {
+      if (ntokens > MAX_LINE_SIZE) {
+        break;
+      }
+    }
+    if (token == EOS) {
+       break;
+    }
+  }
+  return ntokens;
+}
+
 void Dictionary::pushHash(std::vector<int32_t>& hashes, int32_t id) const {
   if (pruneidx_size_ == 0 || id < 0) {
     return;

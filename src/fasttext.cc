@@ -834,9 +834,8 @@ void FastText::train(const Args& args, const TrainCallback& callback) {
             "Supervised models cannot be used as pretrained models");
     }
     
-    int32_t existing = dict_->update(pretrained.dict_, args_->incremental);
-    std::cerr << "Pretrained words: " << existing << " updated, " << (dict_->nwords() - existing) << " added" << std::endl;
-
+    dict_->update(pretrained.dict_, args_->discardOovWords);
+    
     input_ = createRandomMatrix();
     output_ = createTrainOutputMatrix();
     
@@ -844,15 +843,6 @@ void FastText::train(const Args& args, const TrainCallback& callback) {
       int32_t k = dict_->getId(pretrained.dict_->getWord(i));
       if (k >= 0 && k < dict_->nwords()) {
         pretrained.input_->setRowToMatrix(i, *input_, k);
-        if (args_->model != model_name::sup) {
-          pretrained.output_->setRowToMatrix(i, *output_, k);
-        }
-      }
-    }
-    if (pretrained.args_->bucket == args_->bucket) {
-      for (int32_t i = 0; i < args_->bucket; i++) {
-        pretrained.input_->setRowToMatrix(i + pretrained.dict_->nwords() + pretrained.dict_->nlabels(),
-            *input_, i + dict_->nwords() + dict_->nlabels());
       }
     }
   } else {

@@ -42,7 +42,7 @@ Args::Args() {
   saveOutput = false;
   saveVectors = false;
   seed = 0;
-  incremental = false;
+  discardOovWords = false;
 
   qout = false;
   retrain = false;
@@ -206,8 +206,8 @@ void Args::parseArgs(const std::vector<std::string>& args) {
         pretrainedVectors = std::string(args.at(ai + 1));
       } else if (args[ai] == "-pretrainedModel") {
         pretrainedModel = std::string(args.at(ai + 1));
-      } else if (args[ai] == "-incremental") {
-        incremental = true;
+      } else if (args[ai] == "-discardOovWords") {
+        discardOovWords = true;
         ai--;
       } else if (args[ai] == "-saveOutput") {
         saveOutput = true;
@@ -318,8 +318,8 @@ void Args::printTrainingHelp() {
       << pretrainedVectors << "]\n"
       << "  -pretrainedModel    pretrained model ["
       << pretrainedModel << "]\n"
-      << "  -incremental        whether training updates or extends a pretrained model ["
-      << boolToString(incremental) << "]\n"
+      << "  -discardOovWords    whether to discard OOV words from the pre-trained model ["
+      << boolToString(discardOovWords) << "]\n"
       << "  -saveOutput         whether output params should be saved ["
       << boolToString(saveOutput) << "]\n"
       << "  -saveVectors        whether vectors should be saved ["

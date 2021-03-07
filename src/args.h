@@ -59,7 +59,7 @@ class Args {
   int verbose;
   std::string pretrainedVectors;
   std::string pretrainedModel;
-  bool incremental;
+  bool discardOovWords;
   bool saveOutput;
   bool saveVectors;
   int seed;

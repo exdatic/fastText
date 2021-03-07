@@ -30,7 +30,6 @@ Dictionary::Dictionary(std::shared_ptr<Args> args)
       nwords_(0),
       nlabels_(0),
       ntokens_(0),
-      ncounts_(0),
       pruneidx_size_(-1) {}
 
 Dictionary::Dictionary(std::shared_ptr<Args> args, std::istream& in)
@@ -39,7 +38,6 @@ Dictionary::Dictionary(std::shared_ptr<Args> args, std::istream& in)
       nwords_(0),
       nlabels_(0),
       ntokens_(0),
-      ncounts_(0),
       pruneidx_size_(-1) {
   load(in);
 }
@@ -60,7 +58,6 @@ int32_t Dictionary::find(const std::string& w, uint32_t h) const {
 void Dictionary::add(const std::string& w) {
   int32_t h = find(w);
   ntokens_++;
-  ncounts_++;
   if (word2int_[h] == -1) {
     entry e;
     e.word = w;
@@ -123,6 +120,9 @@ void Dictionary::getSubwords(
 bool Dictionary::discard(int32_t id, real rand) const {
   assert(id >= 0);
   assert(id < nwords_);
+  if (args_->model == model_name::sup) {
+    return false;
+  }
   return rand > pdiscard_[id];
 }
 
@@ -237,27 +237,28 @@ bool Dictionary::readWord(std::istream& in, std::string& word) const {
   return !word.empty();
 }
 
-int32_t Dictionary::update(std::shared_ptr<Dictionary> dict, bool incremental) {
-  int32_t existing = 0;
+void Dictionary::update(std::shared_ptr<Dictionary> dict, bool discardOovWords) {
+  int32_t updated = 0, added = 0;
+
+  /* Do not increment ntokens_ as it is used for the epoch calculation.
+   * Do not alter the discard table by updating word counts.
+   * Rare words are discarded less frequently and never if count=1.
+   */
   for (int32_t i = 0; i < dict->nwords_; i++) {
     const std::string& w = dict->words_[i].word;
-    int32_t c = dict->words_[i].count;
     int32_t h = find(w);
     if (word2int_[h] == -1) {
-      entry e;
-      e.word = w;
-      e.count = c;
-      e.type = getType(w);
-      words_.push_back(e);
-      word2int_[h] = size_++;
-      ncounts_ += c;
-    } else {
-      entry &e = words_[word2int_[h]];
-      if (incremental) {
-        e.count += c;
-        ncounts_++;
+      if (!discardOovWords) {
+        entry e;
+        e.word = w;
+        e.count = 1;
+        e.type = getType(w);
+        words_.push_back(e);
+        word2int_[h] = size_++;
+        added++;
       }
-      existing++;
+    } else {
+      updated++;
     }
   }
   
@@ -266,7 +267,7 @@ int32_t Dictionary::update(std::shared_ptr<Dictionary> dict, bool incremental) {
     words_[0].count = 1e+18;
   }
   
-  threshold(args_->minCount, args_->minCountLabel);
+  threshold(1, 0);
   initTableDiscard();
   initNgrams();
 
@@ -274,7 +275,8 @@ int32_t Dictionary::update(std::shared_ptr<Dictionary> dict, bool incremental) {
     assert(words_[0].word == "<PLACEHOLDER>");
     words_[0].count = 0;
   }
-  return existing;
+  
+  std::cerr << "Pretrained words: " << updated << " updated, " << added << " added" << std::endl;
 }
 
 void Dictionary::readFromFile(std::istream& in) {
@@ -357,7 +359,7 @@ void Dictionary::threshold(int64_t t, int64_t tl) {
 void Dictionary::initTableDiscard() {
   pdiscard_.resize(size_);
   for (size_t i = 0; i < size_; i++) {
-    real f = real(words_[i].count) / real(ncounts_);
+    real f = real(words_[i].count) / real(ntokens_);
     pdiscard_[i] = std::sqrt(args_->t / f) + args_->t / f;
   }
 }

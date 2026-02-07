@@ -12,7 +12,7 @@ Requires only **numpy** and **numba** (no C compiler, no scipy).
 
 from __future__ import annotations
 
-import argparse, math, sys, time
+import argparse, math, os, sys, tempfile, time
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -109,16 +109,14 @@ def _train_epoch(wi, wo, flat_ids, flat_hashes, offsets, n_sentences,
 
             target = wid
 
-            # save & mask target position
-            old_id = flat_ids[off + w]
-            old_h  = flat_hashes[off + w]
-            flat_ids[off + w]    = np.int32(0)
-            flat_hashes[off + w] = np.int32(0)
-
-            # ── build context (scalar indexing into flat arrays) ──
+            # ── build context: placeholder (0) at target position w ──
+            # (flat arrays are never modified — safe for read-only mmap)
             n_ctx = np.int32(0)
             for k in range(n):
-                ctx_buf[n_ctx] = flat_ids[off + k]
+                if k == w:
+                    ctx_buf[n_ctx] = np.int32(0)  # placeholder replaces target
+                else:
+                    ctx_buf[n_ctx] = flat_ids[off + k]
                 n_ctx += 1
 
             # word n-gram features with optional dropout
@@ -145,7 +143,8 @@ def _train_epoch(wi, wo, flat_ids, flat_hashes, offsets, n_sentences,
                             break
                     if skip:
                         continue
-                    hv = np.uint64(np.int64(flat_hashes[off + i])) & _M
+                    h_i = np.int32(0) if i == w else flat_hashes[off + i]
+                    hv = np.uint64(np.int64(h_i)) & _M
                     for j in range(i + 1, min(n, i + word_ngrams)):
                         skip_j = False
                         for di in range(n_drop):
@@ -154,13 +153,10 @@ def _train_epoch(wi, wo, flat_ids, flat_hashes, offsets, n_sentences,
                                 break
                         if skip_j:
                             break
-                        hv = (hv * np.uint64(116049371) + (np.uint64(np.int64(flat_hashes[off + j])) & _M)) & _M
+                        h_j = np.int32(0) if j == w else flat_hashes[off + j]
+                        hv = (hv * np.uint64(116049371) + (np.uint64(np.int64(h_j)) & _M)) & _M
                         ctx_buf[n_ctx] = np.int32(nwords + np.int32(hv % np.uint64(bucket)))
                         n_ctx += 1
-
-            # restore target position
-            flat_ids[off + w]    = old_id
-            flat_hashes[off + w] = old_h
 
             if n_ctx == 0:
                 continue
@@ -457,9 +453,18 @@ class Sent2Vec:
         rng_state = np.int64(self.seed + 1)
         rng_discard = np.uint64(self.seed)
 
-        # pre-tokenise entire corpus and flatten into contiguous arrays
-        sentences_ids = []
-        sentences_hashes = []
+        # Tokenise corpus → stream to temp binary files (never holds corpus in RAM).
+        # The mmap'd arrays are read-only; _train_epoch never modifies them.
+        tmp_dir = tempfile.mkdtemp(prefix="s2v_")
+        ids_path = os.path.join(tmp_dir, "ids.bin")
+        hash_path = os.path.join(tmp_dir, "hash.bin")
+        off_path = os.path.join(tmp_dir, "off.bin")
+
+        f_ids = open(ids_path, "wb")
+        f_hash = open(hash_path, "wb")
+        f_off = open(off_path, "wb")
+        f_off.write(np.int64(0).tobytes())
+
         with open(corpus, encoding="utf-8", errors="replace") as f:
             for line in f:
                 stripped = line.strip()
@@ -467,22 +472,18 @@ class Sent2Vec:
                     continue
                 ids, hashes = v.tokenise(stripped.split())
                 if len(ids) > 1:
-                    sentences_ids.append(ids)
-                    sentences_hashes.append(hashes)
+                    f_ids.write(ids.tobytes())
+                    f_hash.write(hashes.tobytes())
+                    f_off.write(np.int64(f_ids.tell() // 4).tobytes())
 
-        n_sentences = len(sentences_ids)
-        offsets = np.empty(n_sentences + 1, np.int64)
-        offsets[0] = 0
-        for i in range(n_sentences):
-            offsets[i + 1] = offsets[i] + len(sentences_ids[i])
-        total_toks = int(offsets[n_sentences])
-        flat_ids = np.empty(total_toks, np.int32)
-        flat_hashes = np.empty(total_toks, np.int32)
-        for i in range(n_sentences):
-            a, b = int(offsets[i]), int(offsets[i + 1])
-            flat_ids[a:b] = sentences_ids[i]
-            flat_hashes[a:b] = sentences_hashes[i]
-        del sentences_ids, sentences_hashes
+        f_ids.close()
+        f_hash.close()
+        f_off.close()
+
+        flat_ids = np.memmap(ids_path, dtype=np.int32, mode="r")
+        flat_hashes = np.memmap(hash_path, dtype=np.int32, mode="r")
+        offsets = np.memmap(off_path, dtype=np.int64, mode="r")
+        n_sentences = len(offsets) - 1
 
         tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
@@ -518,6 +519,18 @@ class Sent2Vec:
         if self.verbose > 0:
             print(f"\rDone — avg loss {loss_acc / max(n_acc, 1):.4f}"
                   f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
+
+        # clean up mmap temp files
+        del flat_ids, flat_hashes, offsets
+        for p in (ids_path, hash_path, off_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

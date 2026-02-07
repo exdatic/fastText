@@ -1,11 +1,20 @@
-"""starspace — StarSpace-compatible "Embed All The Things" in pure Python.
+"""starspace — StarSpace "Embed All The Things" in pure Python.
 
-Implements trainMode=0 (classification/tagging) with:
+Implements all six training modes (trainMode 0-5) with:
 - Hinge (margin ranking) loss + negative sampling
 - Cosine similarity (L2-normalized embeddings)
 - AdaGrad optimisation
 - Shared LHS/RHS embedding matrix
 - Word n-grams
+
+Training modes::
+
+    0  Classification   — LHS = words,             RHS = 1 random label
+    1  Label from rest  — LHS = words + rest labels, RHS = 1 random label
+    2  Inverted labels  — LHS = words + 1 label,   RHS = rest labels
+    3  Pair prediction  — LHS = words + 1 label,   RHS = 1 other label
+    4  Fixed pair       — LHS = words + label[0],  RHS = label[1]
+    5  Word embedding   — LHS = context words,     RHS = target word
 
 ::
 
@@ -25,7 +34,7 @@ Requires only **numpy** and **numba** (no C compiler, no scipy).
 
 from __future__ import annotations
 
-import argparse, math, os, sys, tempfile, time
+import argparse, math, os, random as _random, sys, tempfile, time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator
@@ -64,33 +73,41 @@ def _fnv1a_bytes(data):
 # ── monolithic epoch kernel (hinge loss, cosine similarity, AdaGrad) ─────────
 #
 # ALL training for one epoch in a single @njit call.
-# Per-example:  LHS = bag-of-words + n-grams, RHS = single label.
+# Supports extra LHS features (labels in LHS for modes 1-4) and
+# multi-label RHS (mode 2: sum all RHS labels).
+#
 # Hinge loss: max(0, margin - cos(lhs, rhs+) + cos(lhs, rhs-))
 # AdaGrad: per-row accumulated gradient for adaptive learning rates.
 
 @njit(fastmath=True, cache=True)
 def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
-                 lhs_offsets, label_offsets, n_examples,
-                 neg_pool, neg_pool_size,
+                 flat_lhs_extra, lhs_offsets, label_offsets, extra_offsets,
+                 n_examples, neg_pool, neg_pool_size,
                  nwords, nlabels, dim, word_ngrams, bucket,
                  margin, neg_search_limit, base_lr, total_tokens,
-                 rng_state, tok_count, norm_limit):
-    """Train one full epoch using hinge loss with cosine similarity.
-
-    Returns (loss_sum, n_steps, tok_count, rng_state).
-    """
+                 rng_state, tok_count, norm_limit, multi_rhs):
+    """Train one full epoch.  Returns (loss_sum, n_steps, tok_count, rng_state)."""
     loss_sum = np.float64(0.0)
     n_steps = np.int32(0)
     _M = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-    # Size buffers for longest sentence
+    # Size buffers for longest example
     max_n = np.int32(0)
+    max_extra = np.int32(0)
+    max_rhs = np.int32(0)
     for s in range(n_examples):
         slen = np.int32(lhs_offsets[s + 1] - lhs_offsets[s])
         if slen > max_n:
             max_n = slen
+        elen = np.int32(extra_offsets[s + 1] - extra_offsets[s])
+        if elen > max_extra:
+            max_extra = elen
+        rlen = np.int32(label_offsets[s + 1] - label_offsets[s])
+        if rlen > max_rhs:
+            max_rhs = rlen
     wng = max(word_ngrams, np.int32(1))
-    ctx_buf = np.empty(max_n * wng, np.int32)
+    ctx_buf = np.empty(max_n * wng + max_extra, np.int32)
+    target_buf = np.empty(max(max_rhs, np.int32(1)), np.int32)
 
     lhs_vec = np.empty(dim, np.float32)
     rhs_pos = np.empty(dim, np.float32)
@@ -110,7 +127,7 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
         lb_end = label_offsets[s + 1]
         n_lb = np.int32(lb_end - lb_start)
 
-        if n_words == 0 or n_lb == 0:
+        if n_lb == 0:
             continue
 
         tok_count += np.int64(n_words)
@@ -120,12 +137,20 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
         if cur_lr <= np.float32(0.0):
             break
 
-        # Randomly select one label
-        rng_state = np.int64((rng_state * np.int64(48271)) % np.int64(2147483647))
-        target = flat_labels[lb_start + np.int32(
-            np.uint64(rng_state) % np.uint64(n_lb))]
+        # ── resolve RHS target(s) ──
+        n_targets = np.int32(0)
+        if multi_rhs:
+            for k in range(lb_start, lb_end):
+                target_buf[n_targets] = flat_labels[k]
+                n_targets += 1
+        else:
+            rng_state = np.int64(
+                (rng_state * np.int64(48271)) % np.int64(2147483647))
+            target_buf[0] = flat_labels[lb_start + np.int32(
+                np.uint64(rng_state) % np.uint64(n_lb))]
+            n_targets = np.int32(1)
 
-        # ── build LHS features (words + word n-grams) ──
+        # ── build LHS features (words + word n-grams + extra labels) ──
         n_ctx = np.int32(0)
         for k in range(n_words):
             ctx_buf[n_ctx] = flat_lhs[in_start + k]
@@ -141,6 +166,13 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
                     ctx_buf[n_ctx] = np.int32(
                         ngram_base + np.int32(hv % np.uint64(bucket)))
                     n_ctx += 1
+
+        # Append extra LHS features (label embeddings for modes 1-4)
+        ex_start = extra_offsets[s]
+        ex_end = extra_offsets[s + 1]
+        for k in range(ex_start, ex_end):
+            ctx_buf[n_ctx] = flat_lhs_extra[k]
+            n_ctx += 1
 
         if n_ctx == 0:
             continue
@@ -160,10 +192,15 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
         for d in range(dim):
             lhs_vec[d] *= inv_norm
 
-        # ── RHS positive: L2 normalise ──
+        # ── RHS positive: sum target embeddings + L2 normalise ──
+        for d in range(dim):
+            rhs_pos[d] = np.float32(0.0)
+        for t in range(n_targets):
+            tgt = target_buf[t]
+            for d in range(dim):
+                rhs_pos[d] += emb[tgt, d]
         norm_sq = np.float32(0.0)
         for d in range(dim):
-            rhs_pos[d] = emb[target, d]
             norm_sq += rhs_pos[d] * rhs_pos[d]
         inv_norm = np.float32(1.0 / np.float32(
             np.sqrt(np.float64(norm_sq)) + 1e-10))
@@ -186,7 +223,13 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
                 np.uint64(rng_state) % np.uint64(neg_pool_size))]
             neg_ids[ni] = neg_label
 
-            if neg_label == target:
+            # Skip if negative is any of the positive targets
+            is_pos = False
+            for t in range(n_targets):
+                if neg_label == target_buf[t]:
+                    is_pos = True
+                    break
+            if is_pos:
                 neg_flags[ni] = np.int32(0)
                 continue
 
@@ -235,11 +278,13 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
         # ── update RHS positive: push toward LHS (AdaGrad) ──
         pos_rate = (np.float32(np.float64(cur_lr) /
                     np.float64(neg_search_limit)) * np.float32(n_valid))
-        adagrad[target] += np.float32(1.0) / np.float32(dim)
-        eff_lr = pos_rate / np.float32(
-            np.sqrt(np.float64(adagrad[target]) + 1e-6))
-        for d in range(dim):
-            emb[target, d] += eff_lr * lhs_vec[d]
+        for t in range(n_targets):
+            tgt = target_buf[t]
+            adagrad[tgt] += np.float32(1.0) / np.float32(dim)
+            eff_lr = pos_rate / np.float32(
+                np.sqrt(np.float64(adagrad[tgt]) + 1e-6))
+            for d in range(dim):
+                emb[tgt, d] += eff_lr * lhs_vec[d]
 
         # ── update RHS negatives: push away from LHS (AdaGrad) ──
         neg_rate = np.float32(np.float64(cur_lr) /
@@ -265,14 +310,16 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
                     scale = norm_limit / rnorm
                     for d in range(dim):
                         emb[row, d] *= scale
-            rnorm = np.float32(0.0)
-            for d in range(dim):
-                rnorm += emb[target, d] * emb[target, d]
-            rnorm = np.float32(np.sqrt(np.float64(rnorm)))
-            if rnorm > norm_limit:
-                scale = norm_limit / rnorm
+            for t in range(n_targets):
+                tgt = target_buf[t]
+                rnorm = np.float32(0.0)
                 for d in range(dim):
-                    emb[target, d] *= scale
+                    rnorm += emb[tgt, d] * emb[tgt, d]
+                rnorm = np.float32(np.sqrt(np.float64(rnorm)))
+                if rnorm > norm_limit:
+                    scale = norm_limit / rnorm
+                    for d in range(dim):
+                        emb[tgt, d] *= scale
 
         n_steps += 1
 
@@ -368,7 +415,7 @@ class Vocab:
 # ── model ────────────────────────────────────────────────────────────────────
 
 class StarSpace:
-    """Pure-Python StarSpace classifier/embedder.
+    """Pure-Python StarSpace classifier/embedder (trainMode 0-5).
 
     ::
 
@@ -378,13 +425,13 @@ class StarSpace:
 
     __slots__ = ("emb", "vocab", "dim", "word_ngrams", "margin",
                  "neg_search_limit", "lr", "epoch", "seed",
-                 "norm_limit", "verbose")
+                 "norm_limit", "verbose", "train_mode", "ws")
 
     def __init__(self, *, vocab: Vocab, emb: np.ndarray,
                  dim: int, word_ngrams: int = 1, margin: float = 0.05,
                  neg_search_limit: int = 50, lr: float = 0.01,
                  epoch: int = 5, seed: int = 0, norm_limit: float = 1.0,
-                 verbose: int = 2):
+                 verbose: int = 2, train_mode: int = 0, ws: int = 5):
         self.vocab, self.emb = vocab, emb
         self.dim = dim
         self.word_ngrams = word_ngrams
@@ -393,12 +440,16 @@ class StarSpace:
         self.lr, self.epoch, self.seed = lr, epoch, seed
         self.norm_limit = norm_limit
         self.verbose = verbose
+        self.train_mode = train_mode
+        self.ws = ws
 
     # ── prediction ────────────────────────────────────────────────────────
 
     def predict(self, text: str, k: int = 1) -> list[tuple[str, float]]:
         """Predict top-k labels. Returns [(label, cosine_similarity), ...]."""
         v = self.vocab
+        if v.nlabels == 0:
+            return []
         word_ids, word_hashes, _ = v.tokenise_line(text.split())
         if len(word_ids) == 0:
             return []
@@ -438,7 +489,10 @@ class StarSpace:
         """Evaluate on labeled data. Returns (N, precision@k, recall@k).
 
         *data* is a file path (str) or an iterable of token lists.
+        Not available for trainMode 5 (word embedding).
         """
+        if self.train_mode == 5:
+            raise ValueError("test() is not defined for trainMode 5")
         if isinstance(data, str):
             data = iter_lines(data)
         v = self.vocab
@@ -480,7 +534,7 @@ class StarSpace:
             labels=np.array(self.vocab.labels, dtype=object),
             meta=np.array([self.dim, self.word_ngrams, self.epoch, self.seed,
                            self.vocab.ntokens, self.vocab.bucket,
-                           self.neg_search_limit]),
+                           self.neg_search_limit, self.train_mode, self.ws]),
             fmeta=np.array([self.lr, self.margin, self.norm_limit]),
             label_prefix=np.array([self.vocab.label_prefix]),
         )
@@ -507,6 +561,8 @@ class StarSpace:
             word_ngrams=int(m[1]),
             label_prefix=lp,
         )
+        train_mode = int(m[7]) if len(m) > 7 else 0
+        ws = int(m[8]) if len(m) > 8 else 5
         return cls(
             vocab=vocab, emb=d["emb"],
             dim=int(m[0]), word_ngrams=int(m[1]),
@@ -514,6 +570,7 @@ class StarSpace:
             neg_search_limit=int(m[6]),
             lr=float(fm[0]), margin=float(fm[1]),
             norm_limit=float(fm[2]), verbose=2,
+            train_mode=train_mode, ws=ws,
         )
 
     # ── training ─────────────────────────────────────────────────────────
@@ -522,7 +579,8 @@ class StarSpace:
     def train(cls, data, *, dim=100, epoch=5, lr=0.01,
               margin=0.05, neg_search_limit=50, min_count=1,
               word_ngrams=1, bucket=2_000_000, norm_limit=1.0,
-              init_rand_sd=0.001, seed=0, verbose=2) -> StarSpace:
+              init_rand_sd=0.001, seed=0, verbose=2,
+              train_mode=0, ws=5) -> StarSpace:
         """Train a StarSpace model.
 
         *data* is a file path (str) or an iterable of token lists, where each
@@ -530,83 +588,184 @@ class StarSpace:
 
             model = StarSpace.train("train.txt")
             model = StarSpace.train([["__label__pos", "great", "movie"]])
+
+        *train_mode* selects the LHS/RHS construction (0-5).
+        *ws* is the context window size for trainMode 5.
         """
+        # Normalise data to a path so we can iterate cheaply twice.
+        cleanup = None
         if isinstance(data, str):
-            # File path — can iterate twice (vocab + training) cheaply.
-            vocab = Vocab.build(iter_lines(data), min_count=min_count,
+            data_path = data
+        else:
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, prefix="ss_src_")
+            for tokens in data:
+                tmp.write(" ".join(tokens) + "\n")
+            tmp.close()
+            data_path = tmp.name
+            cleanup = tmp.name
+
+        try:
+            vocab = Vocab.build(iter_lines(data_path), min_count=min_count,
                                 bucket=bucket, word_ngrams=word_ngrams,
                                 verbose=verbose)
-            train_data = iter_lines(data)
-        else:
-            # Arbitrary iterable — materialise for two passes.
-            lines = data if isinstance(data, (list, tuple)) else list(data)
-            vocab = Vocab.build(lines, min_count=min_count, bucket=bucket,
-                                word_ngrams=word_ngrams, verbose=verbose)
-            train_data = lines
 
-        # Shared embedding: [words | labels | n-gram buckets]
-        n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
-        rng = np.random.RandomState(seed)
-        emb = (rng.normal(0, init_rand_sd, (n_emb, dim))).astype(np.float32)
+            # Shared embedding: [words | labels | n-gram buckets]
+            n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
+            rng = np.random.RandomState(seed)
+            emb = (rng.normal(0, init_rand_sd, (n_emb, dim))).astype(
+                np.float32)
 
-        model = cls(vocab=vocab, emb=emb, dim=dim, word_ngrams=word_ngrams,
-                    margin=margin, neg_search_limit=neg_search_limit,
-                    lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
-                    verbose=verbose)
-        model._fit(train_data)
+            model = cls(vocab=vocab, emb=emb, dim=dim,
+                        word_ngrams=word_ngrams, margin=margin,
+                        neg_search_limit=neg_search_limit,
+                        lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
+                        verbose=verbose, train_mode=train_mode, ws=ws)
+            model._fit(iter_lines(data_path))
+        finally:
+            if cleanup:
+                try:
+                    os.unlink(cleanup)
+                except OSError:
+                    pass
+
         return model
 
     def _fit(self, data: Iterable[list[str]]):
         v = self.vocab
         total = self.epoch * v.ntokens
         rng_state = np.int64(self.seed + 1)
+        mode = self.train_mode
 
         # AdaGrad accumulator (per-row)
         adagrad = np.zeros(self.emb.shape[0], np.float32)
 
-        # Tokenise → stream to temp binary files (mmap'd)
+        # ── Tokenise + mode conversion → stream to temp binary mmap ──
         tmp_dir = tempfile.mkdtemp(prefix="ss_")
-        ids_path = os.path.join(tmp_dir, "ids.bin")
-        hash_path = os.path.join(tmp_dir, "hash.bin")
-        lbl_path = os.path.join(tmp_dir, "lbl.bin")
-        ioff_path = os.path.join(tmp_dir, "ioff.bin")
-        loff_path = os.path.join(tmp_dir, "loff.bin")
-        neg_path = os.path.join(tmp_dir, "neg.bin")
+        names = ("ids", "hash", "lbl", "extra", "ioff", "loff", "eoff", "neg")
+        paths = {n: os.path.join(tmp_dir, f"{n}.bin") for n in names}
 
-        f_ids = open(ids_path, "wb")
-        f_hash = open(hash_path, "wb")
-        f_lbl = open(lbl_path, "wb")
-        f_ioff = open(ioff_path, "wb")
-        f_loff = open(loff_path, "wb")
-        f_neg = open(neg_path, "wb")
-        f_ioff.write(np.int64(0).tobytes())
-        f_loff.write(np.int64(0).tobytes())
+        f = {n: open(p, "wb") for n, p in paths.items()}
+        f["ioff"].write(np.int64(0).tobytes())
+        f["loff"].write(np.int64(0).tobytes())
+        f["eoff"].write(np.int64(0).tobytes())
+
+        rng_py = _random.Random(self.seed)
 
         for tokens in data:
             word_ids, word_hashes, label_ids = v.tokenise_line(tokens)
-            if len(word_ids) > 0 and len(label_ids) > 0:
-                f_ids.write(word_ids.tobytes())
-                f_hash.write(word_hashes.tobytes())
-                f_lbl.write(label_ids.tobytes())
-                f_ioff.write(np.int64(f_ids.tell() // 4).tobytes())
-                f_loff.write(np.int64(f_lbl.tell() // 4).tobytes())
-                f_neg.write(label_ids.tobytes())
+            nw = len(word_ids)
+            nl = len(label_ids)
 
-        f_ids.close()
-        f_hash.close()
-        f_lbl.close()
-        f_ioff.close()
-        f_loff.close()
-        f_neg.close()
+            if mode == 5:
+                # Word embedding: expand into (context, target) pairs
+                for wi in range(nw):
+                    ctx_start = max(0, wi - self.ws)
+                    ctx_end = min(nw, wi + self.ws + 1)
+                    ctx_w = []
+                    ctx_h = []
+                    for ci in range(ctx_start, ctx_end):
+                        if ci != wi:
+                            ctx_w.append(word_ids[ci])
+                            ctx_h.append(word_hashes[ci])
+                    if not ctx_w:
+                        continue
+                    cw = np.array(ctx_w, dtype=np.int32)
+                    ch = np.array(ctx_h, dtype=np.int32)
+                    tw = np.array([word_ids[wi]], dtype=np.int32)
+                    f["ids"].write(cw.tobytes())
+                    f["hash"].write(ch.tobytes())
+                    f["lbl"].write(tw.tobytes())
+                    f["extra"].write(b"")  # no extra LHS
+                    f["ioff"].write(np.int64(
+                        f["ids"].tell() // 4).tobytes())
+                    f["loff"].write(np.int64(
+                        f["lbl"].tell() // 4).tobytes())
+                    f["eoff"].write(np.int64(
+                        f["extra"].tell() // 4).tobytes())
+                    f["neg"].write(tw.tobytes())
+                continue
 
-        flat_ids = np.memmap(ids_path, dtype=np.int32, mode="r")
-        flat_hashes = np.memmap(hash_path, dtype=np.int32, mode="r")
-        flat_labels = np.memmap(lbl_path, dtype=np.int32, mode="r")
-        input_offsets = np.memmap(ioff_path, dtype=np.int64, mode="r")
-        label_offsets = np.memmap(loff_path, dtype=np.int64, mode="r")
-        neg_pool = np.memmap(neg_path, dtype=np.int32, mode="r")
+            if mode == 0:
+                if nw == 0 or nl == 0:
+                    continue
+                lhs_w, lhs_h = word_ids, word_hashes
+                lhs_extra = np.empty(0, np.int32)
+                rhs = label_ids
+            elif mode == 1:
+                if nw == 0 or nl < 2:
+                    continue
+                idx = rng_py.randrange(nl)
+                lhs_w, lhs_h = word_ids, word_hashes
+                lhs_extra = np.array(
+                    [label_ids[i] for i in range(nl) if i != idx],
+                    dtype=np.int32)
+                rhs = np.array([label_ids[idx]], dtype=np.int32)
+            elif mode == 2:
+                if nw == 0 or nl < 2:
+                    continue
+                idx = rng_py.randrange(nl)
+                lhs_w, lhs_h = word_ids, word_hashes
+                lhs_extra = np.array([label_ids[idx]], dtype=np.int32)
+                rhs = np.array(
+                    [label_ids[i] for i in range(nl) if i != idx],
+                    dtype=np.int32)
+            elif mode == 3:
+                if nl < 2:
+                    continue
+                idx1 = rng_py.randrange(nl)
+                idx2 = idx1
+                while idx2 == idx1:
+                    idx2 = rng_py.randrange(nl)
+                lhs_w, lhs_h = word_ids, word_hashes
+                lhs_extra = np.array([label_ids[idx1]], dtype=np.int32)
+                rhs = np.array([label_ids[idx2]], dtype=np.int32)
+            elif mode == 4:
+                if nl < 2:
+                    continue
+                lhs_w, lhs_h = word_ids, word_hashes
+                lhs_extra = np.array([label_ids[0]], dtype=np.int32)
+                rhs = np.array([label_ids[1]], dtype=np.int32)
+            else:
+                raise ValueError(f"Unknown train_mode {mode}")
+
+            f["ids"].write(lhs_w.tobytes())
+            f["hash"].write(lhs_h.tobytes())
+            f["lbl"].write(rhs.tobytes())
+            f["extra"].write(lhs_extra.tobytes())
+            f["ioff"].write(np.int64(f["ids"].tell() // 4).tobytes())
+            f["loff"].write(np.int64(f["lbl"].tell() // 4).tobytes())
+            f["eoff"].write(np.int64(f["extra"].tell() // 4).tobytes())
+            f["neg"].write(rhs.tobytes())
+
+        for fh in f.values():
+            fh.close()
+
+        def _mmap_or_empty(p, dt):
+            if os.path.getsize(p) == 0:
+                return np.empty(0, dtype=dt)
+            return np.memmap(p, dtype=dt, mode="r")
+
+        flat_ids = _mmap_or_empty(paths["ids"], np.int32)
+        flat_hashes = _mmap_or_empty(paths["hash"], np.int32)
+        flat_labels = _mmap_or_empty(paths["lbl"], np.int32)
+        flat_extra = _mmap_or_empty(paths["extra"], np.int32)
+        input_offsets = _mmap_or_empty(paths["ioff"], np.int64)
+        label_offsets = _mmap_or_empty(paths["loff"], np.int64)
+        extra_offsets = _mmap_or_empty(paths["eoff"], np.int64)
+        neg_pool = _mmap_or_empty(paths["neg"], np.int32)
         n_examples = len(input_offsets) - 1
         neg_pool_size = len(neg_pool)
+
+        if n_examples == 0 or neg_pool_size == 0:
+            if self.verbose > 0:
+                print("No training examples.", file=sys.stderr)
+            self._cleanup_mmap(paths, tmp_dir, [
+                flat_ids, flat_hashes, flat_labels, flat_extra,
+                input_offsets, label_offsets, extra_offsets, neg_pool])
+            return
+
+        multi_rhs = np.int32(1) if mode == 2 else np.int32(0)
 
         tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
@@ -617,13 +776,14 @@ class StarSpace:
             loss, steps, tok_count, rng_state = _train_epoch(
                 self.emb, adagrad,
                 flat_ids, flat_hashes, flat_labels,
-                input_offsets, label_offsets,
+                flat_extra, input_offsets, label_offsets, extra_offsets,
                 np.int32(n_examples), neg_pool, np.int64(neg_pool_size),
                 np.int32(v.nwords), np.int32(v.nlabels), np.int32(self.dim),
                 np.int32(self.word_ngrams), np.int32(v.bucket),
                 np.float32(self.margin), np.int32(self.neg_search_limit),
                 np.float32(self.lr), np.int64(total),
-                rng_state, tok_count, np.float32(self.norm_limit))
+                rng_state, tok_count, np.float32(self.norm_limit),
+                multi_rhs)
             loss_acc += float(loss)
             n_acc += int(steps)
             ep += 1
@@ -642,11 +802,15 @@ class StarSpace:
             print(f"\rDone — avg loss {avg:.4f}"
                   f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
 
-        # clean up mmap temp files
-        del flat_ids, flat_hashes, flat_labels
-        del input_offsets, label_offsets, neg_pool
-        for p in (ids_path, hash_path, lbl_path, ioff_path, loff_path,
-                  neg_path):
+        self._cleanup_mmap(paths, tmp_dir, [
+            flat_ids, flat_hashes, flat_labels, flat_extra,
+            input_offsets, label_offsets, extra_offsets, neg_pool])
+
+    @staticmethod
+    def _cleanup_mmap(paths, tmp_dir, arrays):
+        for a in arrays:
+            del a
+        for p in paths.values():
             try:
                 os.unlink(p)
             except OSError:
@@ -676,6 +840,8 @@ def _cli():
     tr.add_argument("--norm-limit",       type=float, default=1.0)
     tr.add_argument("--init-rand-sd",     type=float, default=0.001)
     tr.add_argument("--seed",             type=int,   default=0)
+    tr.add_argument("--train-mode",       type=int,   default=0)
+    tr.add_argument("--ws",               type=int,   default=5)
 
     ts = sub.add_parser("test")
     ts.add_argument("model")
@@ -694,7 +860,8 @@ def _cli():
             margin=args.margin, neg_search_limit=args.neg_search_limit,
             min_count=args.min_count, word_ngrams=args.word_ngrams,
             bucket=args.bucket, norm_limit=args.norm_limit,
-            init_rand_sd=args.init_rand_sd, seed=args.seed)
+            init_rand_sd=args.init_rand_sd, seed=args.seed,
+            train_mode=args.train_mode, ws=args.ws)
         m.save(args.output)
     elif args.cmd == "test":
         m = StarSpace.load(args.model)

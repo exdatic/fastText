@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from numba import njit
+from numba import njit, types
+from numba.typed import Dict as NumbaDict
 
 # ── lookup tables (built once at import) ─────────────────────────────────────
 
@@ -113,6 +114,102 @@ def _ns_step(wi, wo, ctx, target, neg, neg_table, dim, lr, rng):
 
     return loss, rng
 
+@njit(cache=True)
+def _word_ngram_ids(hashes, n, nwords, bucket, drop):
+    """Compute bucket indices for word n-gram features (numba-accelerated).
+    drop: int32 array of positions to skip (-1 terminated or empty)."""
+    _M = np.uint64(0xFFFFFFFFFFFFFFFF)
+    sz = len(hashes)
+    # worst case: sz * (n-1) entries
+    buf = np.empty(sz * n, np.int32)
+    pos = 0
+    for i in range(sz):
+        # check if i is in drop set
+        skip = False
+        for d in range(len(drop)):
+            if drop[d] == i:
+                skip = True
+                break
+        if skip:
+            continue
+        h = np.uint64(np.int64(hashes[i])) & _M  # sign-extend int32→uint64
+        for j in range(i + 1, min(sz, i + n)):
+            skip_j = False
+            for d in range(len(drop)):
+                if drop[d] == j:
+                    skip_j = True
+                    break
+            if skip_j:
+                break
+            h = (h * np.uint64(116049371) + (np.uint64(np.int64(hashes[j])) & _M)) & _M
+            buf[pos] = np.int32(nwords + np.int32(h % np.uint64(bucket)))
+            pos += 1
+    return buf[:pos]
+
+@njit(cache=True)
+def _train_sentence(wi, wo, ids, hashes, pdiscard, neg_table,
+                    word_ngrams, bucket, dropout_k, nwords, dim,
+                    neg, lr, rng_state, rng_discard):
+    """Process one sentence: iterate over targets, build context, run SGD.
+    Returns (loss_sum, n_steps, rng_state, rng_discard)."""
+    n = len(ids)
+    loss_sum = np.float32(0.0)
+    n_steps = np.int32(0)
+    empty_drop = np.empty(0, np.int32)
+    _MASK48 = np.uint64(0xFFFFFFFFFFFF)
+    _MULT = np.uint64(25214903917)
+    _INC = np.uint64(11)
+    _MASK16 = np.uint64(0xFFFF)
+
+    for w in range(n):
+        # subsampling: discard frequent words (linear congruential RNG)
+        rng_discard = (rng_discard * _MULT + _INC) & _MASK48
+        p = np.float64(rng_discard & _MASK16) / 65536.0
+        if p > np.float64(pdiscard[ids[w]]):
+            continue
+
+        # context = sentence with target replaced by placeholder
+        ctx_ids = ids.copy()
+        ctx_h = hashes.copy()
+        ctx_ids[w] = np.int32(0)
+        ctx_h[w] = np.int32(0)
+
+        # word n-grams with optional dropout
+        if word_ngrams > 1 and bucket > 0:
+            if dropout_k > 0 and n > 2:
+                drop_buf = np.empty(dropout_k, np.int32)
+                n_drop = np.int32(0)
+                while n_drop < dropout_k and n - n_drop > 2:
+                    rng_discard = (rng_discard * _MULT + _INC) & _MASK48
+                    pos = np.int32(1 + (rng_discard % np.uint64(n - 1)))
+                    already = False
+                    for d in range(n_drop):
+                        if drop_buf[d] == pos:
+                            already = True
+                            break
+                    if not already:
+                        drop_buf[n_drop] = pos
+                        n_drop += 1
+                drop = drop_buf[:n_drop]
+            else:
+                drop = empty_drop
+            ngrams = _word_ngram_ids(ctx_h, word_ngrams, nwords, bucket, drop)
+            ctx_arr = np.empty(n + len(ngrams), np.int32)
+            for k in range(n):
+                ctx_arr[k] = ctx_ids[k]
+            for k in range(len(ngrams)):
+                ctx_arr[n + k] = ngrams[k]
+        else:
+            ctx_arr = ctx_ids
+
+        loss, rng_state = _ns_step(wi, wo, ctx_arr, ids[w],
+                                   neg, neg_table, dim,
+                                   np.float32(lr), rng_state)
+        loss_sum += loss
+        n_steps += 1
+
+    return loss_sum, n_steps, rng_state, rng_discard
+
 # ── vocabulary ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -120,6 +217,7 @@ class Vocab:
     words: list[str]         = field(default_factory=list)
     counts: np.ndarray       = field(default_factory=lambda: np.empty(0, np.int64))
     w2i: dict[str, int]      = field(default_factory=dict)
+    whash: dict[str, int]    = field(default_factory=dict)  # pre-computed hashes
     ntokens: int             = 0
     bucket: int              = 0
     word_ngrams: int         = 1
@@ -143,15 +241,17 @@ class Vocab:
         words  = ["<PLACEHOLDER>"] + [w for w, c in freq.most_common() if c >= min_count]
         counts = np.array([0] + [freq[w] for w in words[1:]], dtype=np.int64)
         w2i    = {w: i for i, w in enumerate(words)}
+        # pre-hash every word once (instead of per-occurrence)
+        whash  = {w: _fnv1a(w) for w in words}
 
         if verbose > 0:
             print(f"\rRead {ntokens // 1_000_000}M words — "
                   f"vocab {len(words) - 1} (after min_count={min_count})",
                   file=sys.stderr)
 
-        return cls(words=words, counts=counts, w2i=w2i, ntokens=ntokens,
-                   bucket=(bucket if word_ngrams > 1 else 0),
-                   word_ngrams=word_ngrams, t=t)
+        bkt = bucket if word_ngrams > 1 else 0
+        return cls(words=words, counts=counts, w2i=w2i, whash=whash,
+                   ntokens=ntokens, bucket=bkt, word_ngrams=word_ngrams, t=t)
 
     def __len__(self) -> int:
         return len(self.words)
@@ -165,38 +265,17 @@ class Vocab:
         p[0] = 1.0                                     # placeholder always kept
         return p.astype(np.float32)
 
-    def tokenise(self, tokens: list[str]) -> tuple[list[int], list[int]]:
-        """Map raw tokens → (word_ids, hashes_for_ngrams).
+    def tokenise(self, tokens: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        """Map raw tokens → (word_ids, hashes) as int32 arrays.
         Unknown words are silently skipped."""
+        w2i, whash = self.w2i, self.whash
         ids, hashes = [], []
         for tok in tokens:
-            wid = self.w2i.get(tok, -1)
+            wid = w2i.get(tok, -1)
             if wid >= 0:
                 ids.append(wid)
-                hashes.append(_fnv1a(tok))
-        return ids, hashes
-
-    def word_ngram_ids(self, hashes: list[int], *, drop: set[int] | None = None
-                       ) -> list[int]:
-        """Compute bucket indices for word n-gram features.
-        Matches the C++ uint64_t arithmetic in addWordNgrams exactly."""
-        if self.word_ngrams <= 1 or self.bucket == 0:
-            return []
-        _M = 0xFFFFFFFFFFFFFFFF          # uint64 mask
-        out: list[int] = []
-        n = self.word_ngrams
-        sz = len(hashes)
-        for i in range(sz):
-            if drop and i in drop:
-                continue
-            # C++: uint64_t h = hashes[i]  (sign-extends int32→uint64)
-            h = hashes[i] & _M
-            for j in range(i + 1, min(sz, i + n)):
-                if drop and j in drop:
-                    break
-                h = (h * 116049371 + (hashes[j] & _M)) & _M
-                out.append(len(self) + int(h % self.bucket))
-        return out
+                hashes.append(whash[tok])
+        return np.array(ids, dtype=np.int32), np.array(hashes, dtype=np.int32)
 
 # ── model ────────────────────────────────────────────────────────────────────
 
@@ -275,10 +354,12 @@ class Sent2Vec:
         counts = d["counts"]
         m = d["meta"]
         fm = d["fmeta"]
+        whash = {w: _fnv1a(w) for w in words}
         vocab = Vocab(
             words=words,
             counts=counts,
             w2i={w: i for i, w in enumerate(words)},
+            whash=whash,
             ntokens=int(m[6]),
             bucket=int(m[7]),
             word_ngrams=int(m[2]),
@@ -320,54 +401,55 @@ class Sent2Vec:
         v = self.vocab
         pdiscard = v.discard_prob
         total = self.epoch * v.ntokens
-        rng = np.random.RandomState(self.seed)
+        nwords = np.int32(len(v))
         rng_state = np.int64(self.seed + 1)
+        rng_discard = np.uint64(self.seed)
 
-        # pre-load corpus
-        sentences = [line.split() for line in
-                     open(corpus, encoding="utf-8", errors="replace")
-                     if line.strip()]
+        # pre-tokenise entire corpus to numpy arrays (once, not per epoch)
+        corpus_ids = []
+        corpus_hashes = []
+        with open(corpus, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                ids, hashes = v.tokenise(stripped.split())
+                if len(ids) > 1:
+                    corpus_ids.append(ids)
+                    corpus_hashes.append(hashes)
 
         tok_count = 0
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
 
+        # warm up numba on a tiny call
+        _dummy_ids = np.array([1, 2], np.int32)
+        _dummy_h = np.array([0, 0], np.int32)
+        _train_sentence(self.wi, self.wo, _dummy_ids, _dummy_h,
+                        pdiscard, neg_table, self.word_ngrams,
+                        np.int32(v.bucket), np.int32(self.dropout_k),
+                        nwords, np.int32(self.dim), np.int32(self.neg),
+                        np.float32(self.lr), rng_state, rng_discard)
+
         for ep in range(self.epoch):
-            for si, toks in enumerate(sentences):
-                ids, hashes = v.tokenise(toks)
+            for si in range(len(corpus_ids)):
+                ids = corpus_ids[si]
+                hashes = corpus_hashes[si]
                 tok_count += len(ids)
-                if len(ids) <= 1:
-                    continue
 
                 progress = tok_count / total
                 cur_lr = self.lr * (1.0 - progress)
                 if cur_lr <= 0:
                     break
 
-                for w in range(len(ids)):
-                    if rng.random() > pdiscard[ids[w]]:
-                        continue
-
-                    # context = sentence with target replaced by placeholder
-                    ctx = list(ids)
-                    ctx_h = list(hashes)
-                    ctx[w], ctx_h[w] = 0, 0
-
-                    # word n-grams (with optional dropout)
-                    drop = None
-                    if self.dropout_k > 0 and len(ctx) > 2:
-                        drop = set()
-                        while len(drop) < self.dropout_k and len(ctx) - len(drop) > 2:
-                            drop.add(rng.randint(1, len(ctx) - 1))
-                    ngrams = v.word_ngram_ids(ctx_h, drop=drop)
-                    ctx_arr = np.array(ctx + ngrams, dtype=np.int32)
-
-                    loss, rng_state = _ns_step(
-                        self.wi, self.wo, ctx_arr, np.int32(ids[w]),
-                        self.neg, neg_table, self.dim,
-                        np.float32(cur_lr), rng_state)
-                    loss_acc += float(loss)
-                    n_acc += 1
+                loss, steps, rng_state, rng_discard = _train_sentence(
+                    self.wi, self.wo, ids, hashes, pdiscard, neg_table,
+                    np.int32(self.word_ngrams), np.int32(v.bucket),
+                    np.int32(self.dropout_k), nwords, np.int32(self.dim),
+                    np.int32(self.neg), np.float32(cur_lr),
+                    rng_state, rng_discard)
+                loss_acc += float(loss)
+                n_acc += int(steps)
 
                 if self.verbose > 1 and si % 1000 == 0:
                     _progress(tok_count, total, t0, cur_lr, loss_acc, n_acc)
@@ -382,15 +464,15 @@ class Sent2Vec:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _build_neg_table(counts: np.ndarray, size: int = 10_000_000) -> np.ndarray:
+    """Build negative-sampling table. Vectorised with numpy."""
     sqrt_c = np.sqrt(counts.astype(np.float64))
     prob = sqrt_c / sqrt_c.sum()
-    table = np.zeros(size, np.int32)
-    i, cum = 0, prob[0]
-    for j in range(size):
-        while i < len(prob) - 1 and j / size > cum:
-            i += 1
-            cum += prob[i]
-        table[j] = i + 1                               # +1 to skip placeholder
+    cum = np.cumsum(prob)
+    # For each slot j in [0, size), find the word whose cumulative prob covers j/size
+    positions = np.arange(size, dtype=np.float64) / size
+    table = np.searchsorted(cum, positions).astype(np.int32)
+    table = np.clip(table, 0, len(counts) - 1)
+    table += 1  # +1 to skip placeholder
     return table
 
 def _progress(tok, total, t0, lr, loss, n):

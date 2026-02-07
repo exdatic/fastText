@@ -35,18 +35,20 @@ def _make_tables():
 
 _SIG, _LOG = _make_tables()
 
-# ── deterministic hash ───────────────────────────────────────────────────────
+# ── deterministic hash (matches C++ fasttext/sent2vec exactly) ────────────────
 
-_FNV_OFFSET = 0xcbf29ce484222325
-_FNV_PRIME  = 0x00000100000001B3
-_MASK64     = 0xFFFFFFFFFFFFFFFF
+_FNV_OFFSET_32 = 2166136261
+_FNV_PRIME_32  = 16777619
+_MASK32        = 0xFFFFFFFF
 
 def _fnv1a(s: str) -> int:
-    """FNV-1a 64-bit hash — deterministic across processes, unlike hash()."""
-    h = _FNV_OFFSET
+    """FNV-1a 32-bit with signed-char XOR — identical to the C++ implementation."""
+    h = _FNV_OFFSET_32
     for b in s.encode("utf-8"):
-        h = ((h ^ b) * _FNV_PRIME) & _MASK64
-    return h
+        # C++ does: h ^ uint32_t(int8_t(c)) — sign-extends bytes >= 0x80
+        h = ((h ^ (b if b < 128 else b - 256) & _MASK32) * _FNV_PRIME_32) & _MASK32
+    # Return as signed int32 to match C++ int32_t storage
+    return h if h < 0x80000000 else h - 0x100000000
 
 # ── numba kernels ────────────────────────────────────────────────────────────
 
@@ -176,20 +178,23 @@ class Vocab:
 
     def word_ngram_ids(self, hashes: list[int], *, drop: set[int] | None = None
                        ) -> list[int]:
-        """Compute bucket indices for word n-gram features."""
+        """Compute bucket indices for word n-gram features.
+        Matches the C++ uint64_t arithmetic in addWordNgrams exactly."""
         if self.word_ngrams <= 1 or self.bucket == 0:
             return []
+        _M = 0xFFFFFFFFFFFFFFFF          # uint64 mask
         out: list[int] = []
         n = self.word_ngrams
         sz = len(hashes)
         for i in range(sz):
             if drop and i in drop:
                 continue
-            h = hashes[i]
+            # C++: uint64_t h = hashes[i]  (sign-extends int32→uint64)
+            h = hashes[i] & _M
             for j in range(i + 1, min(sz, i + n)):
                 if drop and j in drop:
                     break
-                h = ((h * 116049371) + hashes[j]) & 0xFFFFFFFFFFFFFFFF
+                h = (h * 116049371 + (hashes[j] & _M)) & _M
                 out.append(len(self) + int(h % self.bucket))
         return out
 

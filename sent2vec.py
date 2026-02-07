@@ -18,8 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from numba import njit, types
-from numba.typed import Dict as NumbaDict
+from numba import njit
 
 # ── lookup tables (built once at import) ─────────────────────────────────────
 
@@ -213,6 +212,7 @@ def _train_sentence(wi, wo, ids, hashes, pdiscard, neg_table,
         n_steps += 1
 
     return loss_sum, n_steps, rng_state, rng_discard
+
 
 # ── vocabulary ───────────────────────────────────────────────────────────────
 
@@ -470,16 +470,21 @@ class Sent2Vec:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _build_neg_table(counts: np.ndarray, size: int = 10_000_000) -> np.ndarray:
-    """Build negative-sampling table. Vectorised with numpy."""
+    """Build negative-sampling table. Uses repeat instead of searchsorted."""
     sqrt_c = np.sqrt(counts.astype(np.float64))
     prob = sqrt_c / sqrt_c.sum()
-    cum = np.cumsum(prob)
-    # For each slot j in [0, size), find the word whose cumulative prob covers j/size
-    positions = np.arange(size, dtype=np.float64) / size
-    table = np.searchsorted(cum, positions).astype(np.int32)
-    table = np.clip(table, 0, len(counts) - 1)
-    table += 1  # +1 to skip placeholder
-    return table
+    # allocate each word a number of slots proportional to sqrt(count)
+    slots = np.maximum((prob * size).astype(np.int64), 1)
+    # adjust to hit exactly `size`
+    diff = size - slots.sum()
+    if diff > 0:
+        slots[np.argmax(prob)] += diff
+    elif diff < 0:
+        idx = np.argmax(prob)
+        slots[idx] = max(1, slots[idx] + diff)
+    table = np.repeat(np.arange(len(counts), dtype=np.int32) + 1, slots.astype(np.intp))
+    return table[:size] if len(table) >= size else np.pad(table, (0, size - len(table)),
+                                                          constant_values=table[-1])
 
 def _progress(tok, total, t0, lr, loss, n):
     pct = tok / total * 100

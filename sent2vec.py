@@ -54,167 +54,198 @@ def _fnv1a(s: str) -> int:
     """FNV-1a 32-bit — thin wrapper that encodes str to bytes then calls numba."""
     return int(_fnv1a_bytes(np.frombuffer(s.encode("utf-8"), dtype=np.uint8)))
 
-# ── numba kernels ────────────────────────────────────────────────────────────
+# ── monolithic epoch kernel ──────────────────────────────────────────────────
+#
+# ALL training logic in one @njit function: sentence iteration, subsampling,
+# context building, word n-grams, negative-sampling SGD.
+# Uses flat arrays + scalar indexing (no slices, no copies).
+# Called once per epoch from Python — eliminates ~100K dispatch calls.
 
-@njit(cache=True)
-def _sigmoid(x):
-    if x < -8.0:  return np.float32(0.0)
-    if x >  8.0:  return np.float32(1.0)
-    return _SIG[int((x + 8.0) * 32.0)]                # 512 / 16 = 32
+@njit(fastmath=True, cache=True)
+def _train_epoch(wi, wo, flat_ids, flat_hashes, offsets, n_sentences,
+                 pdiscard, neg_table, word_ngrams, bucket, dropout_k,
+                 nwords, dim, neg, base_lr, total_tokens,
+                 rng_state, rng_discard, tok_count,
+                 sig_table, log_table):
+    """Train one full epoch over all sentences.
 
-@njit(cache=True)
-def _logp(x):
-    if x > 1.0: return np.float32(0.0)
-    return _LOG[int(x * 512.0)]
-
-@njit(cache=True)
-def _dot(a, b):
-    s = np.float32(0.0)
-    for i in range(len(a)):
-        s += a[i] * b[i]
-    return s
-
-@njit(cache=True)
-def _ns_step(wi, wo, ctx, target, neg, neg_table, dim, lr, rng):
-    """One negative-sampling SGD step.  Returns (loss, rng)."""
-    n = len(ctx)
-    if n == 0:
-        return np.float32(0.0), rng
-
-    # hidden = mean of context embeddings
-    h = np.zeros(dim, np.float32)
-    for k in range(n):
-        h += wi[ctx[k]]
-    h *= np.float32(1.0 / n)
-
-    g = np.zeros(dim, np.float32)
+    Returns (loss_sum, n_steps, tok_count, rng_state, rng_discard).
+    """
     neg_sz = len(neg_table)
-
-    # positive example
-    score = _sigmoid(_dot(wo[target], h))
-    alpha = np.float32(lr * (1.0 - score))
-    g += alpha * wo[target]
-    wo[target] += alpha * h
-    loss = -_logp(score)
-
-    # negative examples
-    for _ in range(neg):
-        rng = np.int64((rng * 48271) % 2147483647)
-        ni = neg_table[int(np.uint64(rng) % np.uint64(neg_sz))]
-        while ni == target:
-            rng = np.int64((rng * 48271) % 2147483647)
-            ni = neg_table[int(np.uint64(rng) % np.uint64(neg_sz))]
-        score = _sigmoid(_dot(wo[ni], h))
-        alpha = np.float32(lr * (0.0 - score))
-        g += alpha * wo[ni]
-        wo[ni] += alpha * h
-        loss += -_logp(np.float32(1.0) - score)
-
-    # propagate to input, normalised by context size
-    g *= np.float32(1.0 / n)
-    for k in range(n):
-        wi[ctx[k]] += g
-
-    return loss, rng
-
-@njit(cache=True)
-def _word_ngram_ids(hashes, n, nwords, bucket, drop):
-    """Compute bucket indices for word n-gram features (numba-accelerated).
-    drop: int32 array of positions to skip (-1 terminated or empty)."""
-    _M = np.uint64(0xFFFFFFFFFFFFFFFF)
-    sz = len(hashes)
-    # worst case: sz * (n-1) entries
-    buf = np.empty(sz * n, np.int32)
-    pos = 0
-    for i in range(sz):
-        # check if i is in drop set
-        skip = False
-        for d in range(len(drop)):
-            if drop[d] == i:
-                skip = True
-                break
-        if skip:
-            continue
-        h = np.uint64(np.int64(hashes[i])) & _M  # sign-extend int32→uint64
-        for j in range(i + 1, min(sz, i + n)):
-            skip_j = False
-            for d in range(len(drop)):
-                if drop[d] == j:
-                    skip_j = True
-                    break
-            if skip_j:
-                break
-            h = (h * np.uint64(116049371) + (np.uint64(np.int64(hashes[j])) & _M)) & _M
-            buf[pos] = np.int32(nwords + np.int32(h % np.uint64(bucket)))
-            pos += 1
-    return buf[:pos]
-
-@njit(cache=True)
-def _train_sentence(wi, wo, ids, hashes, pdiscard, neg_table,
-                    word_ngrams, bucket, dropout_k, nwords, dim,
-                    neg, lr, rng_state, rng_discard):
-    """Process one sentence: iterate over targets, build context, run SGD.
-    Returns (loss_sum, n_steps, rng_state, rng_discard)."""
-    n = len(ids)
     loss_sum = np.float32(0.0)
     n_steps = np.int32(0)
-    empty_drop = np.empty(0, np.int32)
+
+    # LCG constants for subsampling RNG
     _MASK48 = np.uint64(0xFFFFFFFFFFFF)
-    _MULT = np.uint64(25214903917)
-    _INC = np.uint64(11)
+    _MULT   = np.uint64(25214903917)
+    _INC    = np.uint64(11)
     _MASK16 = np.uint64(0xFFFF)
+    # n-gram hash mask
+    _M = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-    for w in range(n):
-        rng_discard = (rng_discard * _MULT + _INC) & _MASK48
-        p = np.float64(rng_discard & _MASK16) / 65536.0
-        if p > np.float64(pdiscard[ids[w]]):
-            continue
+    # Pre-allocate reusable buffers sized for the longest sentence
+    max_n = np.int32(0)
+    for s in range(n_sentences):
+        slen = np.int32(offsets[s + 1] - offsets[s])
+        if slen > max_n:
+            max_n = slen
+    wng = max(word_ngrams, np.int32(1))
+    ctx_buf  = np.empty(max_n * wng, np.int32)
+    drop_buf = np.empty(max(dropout_k, np.int32(1)), np.int32)
+    h = np.empty(dim, np.float32)
+    g = np.empty(dim, np.float32)
 
-        target = ids[w]
-        # save & mask target position (avoids copying entire arrays)
-        old_id, old_h = ids[w], hashes[w]
-        ids[w] = np.int32(0)
-        hashes[w] = np.int32(0)
+    for s in range(n_sentences):
+        off = offsets[s]
+        n = np.int32(offsets[s + 1] - off)
+        tok_count += np.int64(n)
 
-        # word n-grams with optional dropout
-        if word_ngrams > 1 and bucket > 0:
-            if dropout_k > 0 and n > 2:
-                drop_buf = np.empty(dropout_k, np.int32)
-                n_drop = np.int32(0)
-                while n_drop < dropout_k and n - n_drop > 2:
-                    rng_discard = (rng_discard * _MULT + _INC) & _MASK48
-                    pos = np.int32(1 + (rng_discard % np.uint64(n - 1)))
-                    already = False
-                    for d in range(n_drop):
-                        if drop_buf[d] == pos:
-                            already = True
-                            break
-                    if not already:
-                        drop_buf[n_drop] = pos
-                        n_drop += 1
-                drop = drop_buf[:n_drop]
-            else:
-                drop = empty_drop
-            ngrams = _word_ngram_ids(hashes, word_ngrams, nwords, bucket, drop)
-            ctx_arr = np.empty(n + len(ngrams), np.int32)
+        progress = np.float64(tok_count) / np.float64(total_tokens)
+        lr = np.float32(np.float64(base_lr) * (1.0 - progress))
+        if lr <= np.float32(0.0):
+            break
+
+        for w in range(n):
+            wid = flat_ids[off + w]
+            rng_discard = (rng_discard * _MULT + _INC) & _MASK48
+            pv = np.float64(rng_discard & _MASK16) / 65536.0
+            if pv > np.float64(pdiscard[wid]):
+                continue
+
+            target = wid
+
+            # save & mask target position
+            old_id = flat_ids[off + w]
+            old_h  = flat_hashes[off + w]
+            flat_ids[off + w]    = np.int32(0)
+            flat_hashes[off + w] = np.int32(0)
+
+            # ── build context (scalar indexing into flat arrays) ──
+            n_ctx = np.int32(0)
             for k in range(n):
-                ctx_arr[k] = ids[k]
-            for k in range(len(ngrams)):
-                ctx_arr[n + k] = ngrams[k]
-        else:
-            ctx_arr = ids
+                ctx_buf[n_ctx] = flat_ids[off + k]
+                n_ctx += 1
 
-        loss, rng_state = _ns_step(wi, wo, ctx_arr, target,
-                                   neg, neg_table, dim,
-                                   np.float32(lr), rng_state)
-        # restore
-        ids[w] = old_id
-        hashes[w] = old_h
-        loss_sum += loss
-        n_steps += 1
+            # word n-gram features with optional dropout
+            if word_ngrams > 1 and bucket > 0:
+                n_drop = np.int32(0)
+                if dropout_k > 0 and n > 2:
+                    while n_drop < dropout_k and n - n_drop > 2:
+                        rng_discard = (rng_discard * _MULT + _INC) & _MASK48
+                        pos = np.int32(1 + np.int32(rng_discard % np.uint64(n - 1)))
+                        already = False
+                        for di in range(n_drop):
+                            if drop_buf[di] == pos:
+                                already = True
+                                break
+                        if not already:
+                            drop_buf[n_drop] = pos
+                            n_drop += 1
 
-    return loss_sum, n_steps, rng_state, rng_discard
+                for i in range(n):
+                    skip = False
+                    for di in range(n_drop):
+                        if drop_buf[di] == i:
+                            skip = True
+                            break
+                    if skip:
+                        continue
+                    hv = np.uint64(np.int64(flat_hashes[off + i])) & _M
+                    for j in range(i + 1, min(n, i + word_ngrams)):
+                        skip_j = False
+                        for di in range(n_drop):
+                            if drop_buf[di] == j:
+                                skip_j = True
+                                break
+                        if skip_j:
+                            break
+                        hv = (hv * np.uint64(116049371) + (np.uint64(np.int64(flat_hashes[off + j])) & _M)) & _M
+                        ctx_buf[n_ctx] = np.int32(nwords + np.int32(hv % np.uint64(bucket)))
+                        n_ctx += 1
 
+            # restore target position
+            flat_ids[off + w]    = old_id
+            flat_hashes[off + w] = old_h
+
+            if n_ctx == 0:
+                continue
+
+            # ── negative-sampling SGD (fully inlined) ──
+            inv_n = np.float32(1.0 / np.float32(n_ctx))
+
+            # hidden = mean of context embeddings (C-style loops for SIMD)
+            for d in range(dim):
+                h[d] = np.float32(0.0)
+            for k in range(n_ctx):
+                row = ctx_buf[k]
+                for d in range(dim):
+                    h[d] += wi[row, d]
+            for d in range(dim):
+                h[d] *= inv_n
+
+            # gradient accumulator
+            for d in range(dim):
+                g[d] = np.float32(0.0)
+
+            # positive example
+            dot_val = np.float32(0.0)
+            for d in range(dim):
+                dot_val += wo[target, d] * h[d]
+            if dot_val < np.float32(-8.0):
+                score = np.float32(0.0)
+            elif dot_val > np.float32(8.0):
+                score = np.float32(1.0)
+            else:
+                score = sig_table[np.int32((dot_val + np.float32(8.0)) * np.float32(32.0))]
+            alpha = lr * (np.float32(1.0) - score)
+            for d in range(dim):
+                g[d] += alpha * wo[target, d]
+                wo[target, d] += alpha * h[d]
+            if score > np.float32(1.0):
+                loss = np.float32(0.0)
+            else:
+                loss = -log_table[np.int32(score * np.float32(512.0))]
+
+            # negative examples
+            for _neg_i in range(neg):
+                rng_state = np.int64((rng_state * np.int64(48271)) % np.int64(2147483647))
+                ni = neg_table[np.int64(np.uint64(rng_state) % np.uint64(neg_sz))]
+                while ni == target:
+                    rng_state = np.int64((rng_state * np.int64(48271)) % np.int64(2147483647))
+                    ni = neg_table[np.int64(np.uint64(rng_state) % np.uint64(neg_sz))]
+
+                dot_val = np.float32(0.0)
+                for d in range(dim):
+                    dot_val += wo[ni, d] * h[d]
+                if dot_val < np.float32(-8.0):
+                    score = np.float32(0.0)
+                elif dot_val > np.float32(8.0):
+                    score = np.float32(1.0)
+                else:
+                    score = sig_table[np.int32((dot_val + np.float32(8.0)) * np.float32(32.0))]
+                alpha = lr * (np.float32(0.0) - score)
+                for d in range(dim):
+                    g[d] += alpha * wo[ni, d]
+                    wo[ni, d] += alpha * h[d]
+                one_m = np.float32(1.0) - score
+                if one_m > np.float32(1.0):
+                    lp = np.float32(0.0)
+                else:
+                    lp = log_table[np.int32(one_m * np.float32(512.0))]
+                loss -= lp
+
+            # propagate gradient to input embeddings
+            for d in range(dim):
+                g[d] *= inv_n
+            for k in range(n_ctx):
+                row = ctx_buf[k]
+                for d in range(dim):
+                    wi[row, d] += g[d]
+
+            loss_sum += loss
+            n_steps += 1
+
+    return loss_sum, n_steps, tok_count, rng_state, rng_discard
 
 
 # ── vocabulary ───────────────────────────────────────────────────────────────
@@ -414,9 +445,9 @@ class Sent2Vec:
         rng_state = np.int64(self.seed + 1)
         rng_discard = np.uint64(self.seed)
 
-        # pre-tokenise entire corpus to numpy arrays (once, not per epoch)
-        corpus_ids = []
-        corpus_hashes = []
+        # pre-tokenise entire corpus and flatten into contiguous arrays
+        sentences_ids = []
+        sentences_hashes = []
         with open(corpus, encoding="utf-8", errors="replace") as f:
             for line in f:
                 stripped = line.strip()
@@ -424,47 +455,63 @@ class Sent2Vec:
                     continue
                 ids, hashes = v.tokenise(stripped.split())
                 if len(ids) > 1:
-                    corpus_ids.append(ids)
-                    corpus_hashes.append(hashes)
+                    sentences_ids.append(ids)
+                    sentences_hashes.append(hashes)
 
-        tok_count = 0
+        n_sentences = len(sentences_ids)
+        offsets = np.empty(n_sentences + 1, np.int64)
+        offsets[0] = 0
+        for i in range(n_sentences):
+            offsets[i + 1] = offsets[i] + len(sentences_ids[i])
+        total_toks = int(offsets[n_sentences])
+        flat_ids = np.empty(total_toks, np.int32)
+        flat_hashes = np.empty(total_toks, np.int32)
+        for i in range(n_sentences):
+            a, b = int(offsets[i]), int(offsets[i + 1])
+            flat_ids[a:b] = sentences_ids[i]
+            flat_hashes[a:b] = sentences_hashes[i]
+        del sentences_ids, sentences_hashes
+
+        # warm up numba JIT (first call compiles; subsequent use cache)
+        _dummy_ids = np.array([1, 2], np.int32)
+        _dummy_h = np.array([0, 0], np.int32)
+        _dummy_off = np.array([0, 2], np.int64)
+        if self.verbose > 0:
+            print("Compiling JIT kernel...", end="", file=sys.stderr)
+        _train_epoch(self.wi, self.wo, _dummy_ids, _dummy_h, _dummy_off,
+                     np.int32(1), pdiscard, neg_table,
+                     np.int32(self.word_ngrams), np.int32(v.bucket),
+                     np.int32(self.dropout_k), nwords, np.int32(self.dim),
+                     np.int32(self.neg), np.float32(self.lr),
+                     np.int64(total), rng_state, rng_discard,
+                     np.int64(0), _SIG, _LOG)
+        if self.verbose > 0:
+            print(" done", file=sys.stderr)
+
+        tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
 
-        # warm up numba on a tiny call
-        _dummy_ids = np.array([1, 2], np.int32)
-        _dummy_h = np.array([0, 0], np.int32)
-        _train_sentence(self.wi, self.wo, _dummy_ids, _dummy_h,
-                        pdiscard, neg_table, self.word_ngrams,
-                        np.int32(v.bucket), np.int32(self.dropout_k),
-                        nwords, np.int32(self.dim), np.int32(self.neg),
-                        np.float32(self.lr), rng_state, rng_discard)
-
         for ep in range(self.epoch):
-            for si in range(len(corpus_ids)):
-                ids = corpus_ids[si]
-                hashes = corpus_hashes[si]
-                tok_count += len(ids)
+            loss, steps, tok_count, rng_state, rng_discard = _train_epoch(
+                self.wi, self.wo, flat_ids, flat_hashes, offsets,
+                np.int32(n_sentences), pdiscard, neg_table,
+                np.int32(self.word_ngrams), np.int32(v.bucket),
+                np.int32(self.dropout_k), nwords, np.int32(self.dim),
+                np.int32(self.neg), np.float32(self.lr),
+                np.int64(total), rng_state, rng_discard,
+                tok_count, _SIG, _LOG)
+            loss_acc += float(loss)
+            n_acc += int(steps)
 
-                progress = tok_count / total
-                cur_lr = self.lr * (1.0 - progress)
-                if cur_lr <= 0:
-                    break
-
-                loss, steps, rng_state, rng_discard = _train_sentence(
-                    self.wi, self.wo, ids, hashes, pdiscard, neg_table,
-                    np.int32(self.word_ngrams), np.int32(v.bucket),
-                    np.int32(self.dropout_k), nwords, np.int32(self.dim),
-                    np.int32(self.neg), np.float32(cur_lr),
-                    rng_state, rng_discard)
-                loss_acc += float(loss)
-                n_acc += int(steps)
-
-                if self.verbose > 1 and si % 1000 == 0:
-                    _progress(tok_count, total, t0, cur_lr, loss_acc, n_acc)
-            else:
-                continue
-            break
+            if self.verbose > 0:
+                elapsed = max(time.time() - t0, 1e-6)
+                wps = int(tok_count) / elapsed
+                pct = int(tok_count) / total * 100
+                avg = loss_acc / max(n_acc, 1)
+                print(f"\r{pct:5.1f}%  {wps:,.0f} w/s  ep={ep+1}/{self.epoch}"
+                      f"  loss={avg:.4f}",
+                      end="", file=sys.stderr)
 
         if self.verbose > 0:
             print(f"\rDone — avg loss {loss_acc / max(n_acc, 1):.4f}"
@@ -484,13 +531,6 @@ def _build_neg_table(counts: np.ndarray) -> np.ndarray:
     # each word i gets floor(sqrt(c_i) * TABLE_SIZE / z) entries — matches C++ loop
     slots = (sqrt_c * _NEG_TABLE_SIZE / z).astype(np.intp)
     return np.repeat(np.arange(len(counts), dtype=np.int32), slots)
-
-def _progress(tok, total, t0, lr, loss, n):
-    pct = tok / total * 100
-    wps = tok / max(time.time() - t0, 1e-6)
-    avg = loss / max(n, 1)
-    print(f"\r{pct:5.1f}%  {wps:,.0f} w/s  lr={lr:.5f}  loss={avg:.4f}",
-          end="", file=sys.stderr)
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 

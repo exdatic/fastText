@@ -9,12 +9,16 @@ Implements trainMode=0 (classification/tagging) with:
 
 ::
 
+    # From a file (convenience):
     model = StarSpace.train("train.txt", dim=100, epoch=5)
-    model.save("model.npz")
-
-    model = StarSpace.load("model.npz")
-    model.predict("the food was great")        # → [("__label__pos", 0.92)]
     model.test("test.txt")                     # → (N, P@1, R@1)
+
+    # From any iterable of token lists:
+    lines = [["__label__pos", "love", "this"], ["__label__neg", "awful"]]
+    model = StarSpace.train(lines, dim=100, epoch=5)
+    model.test(iter_lines("test.txt"))
+
+    model.predict("the food was great")        # → [("__label__pos", 0.92)]
 
 Requires only **numpy** and **numba** (no C compiler, no scipy).
 """
@@ -24,9 +28,26 @@ from __future__ import annotations
 import argparse, math, os, sys, tempfile, time
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Iterable, Iterator
 
 import numpy as np
 from numba import njit
+
+# ── public helpers ────────────────────────────────────────────────────────────
+
+def iter_lines(path: str) -> Iterator[list[str]]:
+    """Yield tokenized lines from a text file.
+
+    Each yielded item is a list of tokens (words and/or ``__label__`` tags).
+    This is the bridge between file-based I/O and the iterator-based core API::
+
+        model = StarSpace.train(iter_lines("train.txt"))
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            tokens = line.split()
+            if tokens:
+                yield tokens
 
 # ── deterministic hash (matches C++ StarSpace / fasttext) ────────────────────
 
@@ -272,22 +293,22 @@ class Vocab:
     label_prefix: str           = "__label__"
 
     @classmethod
-    def build(cls, path: str, *, min_count=1, bucket=2_000_000,
-              word_ngrams=1, label_prefix="__label__", verbose=2) -> Vocab:
+    def build(cls, data: Iterable[list[str]], *, min_count=1,
+              bucket=2_000_000, word_ngrams=1, label_prefix="__label__",
+              verbose=2) -> Vocab:
         word_freq: Counter[str] = Counter()
         label_freq: Counter[str] = Counter()
         ntokens = 0
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                for tok in line.split():
-                    ntokens += 1
-                    if tok.startswith(label_prefix):
-                        label_freq[tok] += 1
-                    else:
-                        word_freq[tok] += 1
-                    if verbose > 1 and ntokens % 1_000_000 == 0:
-                        print(f"\rRead {ntokens // 1_000_000}M words",
-                              end="", file=sys.stderr)
+        for tokens in data:
+            for tok in tokens:
+                ntokens += 1
+                if tok.startswith(label_prefix):
+                    label_freq[tok] += 1
+                else:
+                    word_freq[tok] += 1
+                if verbose > 1 and ntokens % 1_000_000 == 0:
+                    print(f"\rRead {ntokens // 1_000_000}M words",
+                          end="", file=sys.stderr)
 
         real_words = [w for w, c in word_freq.most_common() if c >= min_count]
         labels = [l for l, _ in label_freq.most_common()]
@@ -413,37 +434,37 @@ class StarSpace:
         top_k = np.argsort(sims)[::-1][:k]
         return [(v.labels[i], float(sims[i])) for i in top_k]
 
-    def test(self, path: str, k: int = 1) -> tuple[int, float, float]:
-        """Evaluate on a labeled file. Returns (N, precision@k, recall@k)."""
+    def test(self, data, k: int = 1) -> tuple[int, float, float]:
+        """Evaluate on labeled data. Returns (N, precision@k, recall@k).
+
+        *data* is a file path (str) or an iterable of token lists.
+        """
+        if isinstance(data, str):
+            data = iter_lines(data)
         v = self.vocab
         n = 0
         p_sum = 0.0
         r_sum = 0.0
 
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                tokens = line.split()
-                if not tokens:
-                    continue
+        for tokens in data:
+            true_labels = set()
+            text_tokens = []
+            for tok in tokens:
+                if tok.startswith(v.label_prefix):
+                    true_labels.add(tok)
+                else:
+                    text_tokens.append(tok)
 
-                true_labels = set()
-                text_tokens = []
-                for tok in tokens:
-                    if tok.startswith(v.label_prefix):
-                        true_labels.add(tok)
-                    else:
-                        text_tokens.append(tok)
+            if not true_labels or not text_tokens:
+                continue
 
-                if not true_labels or not text_tokens:
-                    continue
+            preds = self.predict(" ".join(text_tokens), k=k)
+            pred_labels = {label for label, _ in preds}
 
-                preds = self.predict(" ".join(text_tokens), k=k)
-                pred_labels = {label for label, _ in preds}
-
-                matches = len(pred_labels & true_labels)
-                p_sum += matches / max(len(pred_labels), 1)
-                r_sum += matches / len(true_labels)
-                n += 1
+            matches = len(pred_labels & true_labels)
+            p_sum += matches / max(len(pred_labels), 1)
+            r_sum += matches / len(true_labels)
+            n += 1
 
         precision = p_sum / max(n, 1)
         recall = r_sum / max(n, 1)
@@ -498,14 +519,30 @@ class StarSpace:
     # ── training ─────────────────────────────────────────────────────────
 
     @classmethod
-    def train(cls, corpus: str, *, dim=100, epoch=5, lr=0.01,
+    def train(cls, data, *, dim=100, epoch=5, lr=0.01,
               margin=0.05, neg_search_limit=50, min_count=1,
               word_ngrams=1, bucket=2_000_000, norm_limit=1.0,
               init_rand_sd=0.001, seed=0, verbose=2) -> StarSpace:
-        """Train from a labeled text file (__label__... tokens per line)."""
+        """Train a StarSpace model.
 
-        vocab = Vocab.build(corpus, min_count=min_count, bucket=bucket,
-                            word_ngrams=word_ngrams, verbose=verbose)
+        *data* is a file path (str) or an iterable of token lists, where each
+        token list mixes ``__label__*`` tags with ordinary words::
+
+            model = StarSpace.train("train.txt")
+            model = StarSpace.train([["__label__pos", "great", "movie"]])
+        """
+        if isinstance(data, str):
+            # File path — can iterate twice (vocab + training) cheaply.
+            vocab = Vocab.build(iter_lines(data), min_count=min_count,
+                                bucket=bucket, word_ngrams=word_ngrams,
+                                verbose=verbose)
+            train_data = iter_lines(data)
+        else:
+            # Arbitrary iterable — materialise for two passes.
+            lines = data if isinstance(data, (list, tuple)) else list(data)
+            vocab = Vocab.build(lines, min_count=min_count, bucket=bucket,
+                                word_ngrams=word_ngrams, verbose=verbose)
+            train_data = lines
 
         # Shared embedding: [words | labels | n-gram buckets]
         n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
@@ -516,10 +553,10 @@ class StarSpace:
                     margin=margin, neg_search_limit=neg_search_limit,
                     lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
                     verbose=verbose)
-        model._fit(corpus)
+        model._fit(train_data)
         return model
 
-    def _fit(self, corpus: str):
+    def _fit(self, data: Iterable[list[str]]):
         v = self.vocab
         total = self.epoch * v.ntokens
         rng_state = np.int64(self.seed + 1)
@@ -545,20 +582,15 @@ class StarSpace:
         f_ioff.write(np.int64(0).tobytes())
         f_loff.write(np.int64(0).tobytes())
 
-        with open(corpus, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                tokens = line.split()
-                if not tokens:
-                    continue
-                word_ids, word_hashes, label_ids = v.tokenise_line(tokens)
-                if len(word_ids) > 0 and len(label_ids) > 0:
-                    f_ids.write(word_ids.tobytes())
-                    f_hash.write(word_hashes.tobytes())
-                    f_lbl.write(label_ids.tobytes())
-                    f_ioff.write(np.int64(f_ids.tell() // 4).tobytes())
-                    f_loff.write(np.int64(f_lbl.tell() // 4).tobytes())
-                    # Add labels to negative sampling pool
-                    f_neg.write(label_ids.tobytes())
+        for tokens in data:
+            word_ids, word_hashes, label_ids = v.tokenise_line(tokens)
+            if len(word_ids) > 0 and len(label_ids) > 0:
+                f_ids.write(word_ids.tobytes())
+                f_hash.write(word_hashes.tobytes())
+                f_lbl.write(label_ids.tobytes())
+                f_ioff.write(np.int64(f_ids.tell() // 4).tobytes())
+                f_loff.write(np.int64(f_lbl.tell() // 4).tobytes())
+                f_neg.write(label_ids.tobytes())
 
         f_ids.close()
         f_hash.close()
@@ -657,7 +689,8 @@ def _cli():
     args = p.parse_args()
     if args.cmd == "train":
         m = StarSpace.train(
-            args.corpus, dim=args.dim, epoch=args.epoch, lr=args.lr,
+            iter_lines(args.corpus),
+            dim=args.dim, epoch=args.epoch, lr=args.lr,
             margin=args.margin, neg_search_limit=args.neg_search_limit,
             min_count=args.min_count, word_ngrams=args.word_ngrams,
             bucket=args.bucket, norm_limit=args.norm_limit,
@@ -665,7 +698,7 @@ def _cli():
         m.save(args.output)
     elif args.cmd == "test":
         m = StarSpace.load(args.model)
-        n, prec, rec = m.test(args.test_file, k=args.k)
+        n, prec, rec = m.test(iter_lines(args.test_file), k=args.k)
         print(f"N\t{n}")
         print(f"P@{args.k}\t{prec:.4f}")
         print(f"R@{args.k}\t{rec:.4f}")

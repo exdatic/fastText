@@ -165,17 +165,16 @@ def _train_sentence(wi, wo, ids, hashes, pdiscard, neg_table,
     _MASK16 = np.uint64(0xFFFF)
 
     for w in range(n):
-        # subsampling: discard frequent words (linear congruential RNG)
         rng_discard = (rng_discard * _MULT + _INC) & _MASK48
         p = np.float64(rng_discard & _MASK16) / 65536.0
         if p > np.float64(pdiscard[ids[w]]):
             continue
 
-        # context = sentence with target replaced by placeholder
-        ctx_ids = ids.copy()
-        ctx_h = hashes.copy()
-        ctx_ids[w] = np.int32(0)
-        ctx_h[w] = np.int32(0)
+        target = ids[w]
+        # save & mask target position (avoids copying entire arrays)
+        old_id, old_h = ids[w], hashes[w]
+        ids[w] = np.int32(0)
+        hashes[w] = np.int32(0)
 
         # word n-grams with optional dropout
         if word_ngrams > 1 and bucket > 0:
@@ -196,22 +195,26 @@ def _train_sentence(wi, wo, ids, hashes, pdiscard, neg_table,
                 drop = drop_buf[:n_drop]
             else:
                 drop = empty_drop
-            ngrams = _word_ngram_ids(ctx_h, word_ngrams, nwords, bucket, drop)
+            ngrams = _word_ngram_ids(hashes, word_ngrams, nwords, bucket, drop)
             ctx_arr = np.empty(n + len(ngrams), np.int32)
             for k in range(n):
-                ctx_arr[k] = ctx_ids[k]
+                ctx_arr[k] = ids[k]
             for k in range(len(ngrams)):
                 ctx_arr[n + k] = ngrams[k]
         else:
-            ctx_arr = ctx_ids
+            ctx_arr = ids
 
-        loss, rng_state = _ns_step(wi, wo, ctx_arr, ids[w],
+        loss, rng_state = _ns_step(wi, wo, ctx_arr, target,
                                    neg, neg_table, dim,
                                    np.float32(lr), rng_state)
+        # restore
+        ids[w] = old_id
+        hashes[w] = old_h
         loss_sum += loss
         n_steps += 1
 
     return loss_sum, n_steps, rng_state, rng_discard
+
 
 
 # ── vocabulary ───────────────────────────────────────────────────────────────

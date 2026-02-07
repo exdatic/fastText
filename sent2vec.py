@@ -12,10 +12,9 @@ Requires only **numpy** and **numba** (no C compiler, no scipy).
 
 from __future__ import annotations
 
-import argparse, math, struct, sys, time
+import argparse, math, sys, time
 from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 from numba import njit
@@ -49,10 +48,6 @@ def _fnv1a_bytes(data):
         h = (h ^ sb) * np.uint32(16777619)
     # return as signed int32 to match C++ int32_t storage
     return np.int32(h)
-
-def _fnv1a(s: str) -> int:
-    """FNV-1a 32-bit — thin wrapper that encodes str to bytes then calls numba."""
-    return int(_fnv1a_bytes(np.frombuffer(s.encode("utf-8"), dtype=np.uint8)))
 
 # ── monolithic epoch kernel ──────────────────────────────────────────────────
 #
@@ -488,22 +483,6 @@ class Sent2Vec:
             flat_ids[a:b] = sentences_ids[i]
             flat_hashes[a:b] = sentences_hashes[i]
         del sentences_ids, sentences_hashes
-
-        # warm up numba JIT (first call compiles; subsequent use cache)
-        _dummy_ids = np.array([1, 2], np.int32)
-        _dummy_h = np.array([0, 0], np.int32)
-        _dummy_off = np.array([0, 2], np.int64)
-        if self.verbose > 0:
-            print("Compiling JIT kernel...", end="", file=sys.stderr)
-        _train_epoch(self.wi, self.wo, _dummy_ids, _dummy_h, _dummy_off,
-                     np.int32(1), pdiscard, neg_table,
-                     np.int32(self.word_ngrams), np.int32(v.bucket),
-                     np.int32(self.dropout_k), nwords, np.int32(self.dim),
-                     np.int32(self.neg), np.float32(self.lr),
-                     np.int64(total), rng_state, rng_discard,
-                     np.int64(0), _SIG, _LOG)
-        if self.verbose > 0:
-            print(" done", file=sys.stderr)
 
         tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0

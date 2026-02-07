@@ -266,6 +266,7 @@ class Vocab:
               word_ngrams=1, t=1e-4, verbose=2) -> Vocab:
         freq: Counter[str] = Counter()
         ntokens = 0
+        nlines = 0
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 for tok in line.split():
@@ -274,10 +275,17 @@ class Vocab:
                     if verbose > 1 and ntokens % 1_000_000 == 0:
                         print(f"\rRead {ntokens // 1_000_000}M words",
                               end="", file=sys.stderr)
+                nlines += 1
 
-        # filter, sort by frequency desc, prepend placeholder at index 0
-        words  = ["<PLACEHOLDER>"] + [w for w, c in freq.most_common() if c >= min_count]
-        counts = np.array([0] + [freq[w] for w in words[1:]], dtype=np.int64)
+        # C++ counts </s> (one per line) in ntokens
+        ntokens += nlines
+
+        # vocab: <PLACEHOLDER> at 0, </s> at 1 (highest count), then by freq desc
+        # C++ sorts by count desc; placeholder gets count=1e18 to land at [0],
+        # </s> (count=nlines) naturally follows, then real words.
+        real_words = [w for w, c in freq.most_common() if c >= min_count]
+        words  = ["<PLACEHOLDER>", "</s>"] + real_words
+        counts = np.array([0, nlines] + [freq[w] for w in real_words], dtype=np.int64)
         w2i    = {w: i for i, w in enumerate(words)}
         # pre-hash every word once — encode to bytes then call numba kernel
         whash  = {w: int(_fnv1a_bytes(np.frombuffer(w.encode("utf-8"), dtype=np.uint8)))
@@ -285,7 +293,7 @@ class Vocab:
 
         if verbose > 0:
             print(f"\rRead {ntokens // 1_000_000}M words — "
-                  f"vocab {len(words) - 1} (after min_count={min_count})",
+                  f"vocab {len(words) - 2} (after min_count={min_count})",
                   file=sys.stderr)
 
         bkt = bucket if word_ngrams > 1 else 0
@@ -297,19 +305,28 @@ class Vocab:
 
     @property
     def discard_prob(self) -> np.ndarray:
-        """Subsampling keep-probabilities (higher = more likely to keep)."""
-        f = self.counts / max(self.ntokens, 1)
+        """Subsampling discard table: pdiscard = sqrt(t/f) + t/f.
+
+        Matches C++ initTableDiscard(). In C++ the placeholder is given
+        count=1e18 during this computation (making pdiscard~0), then reset
+        to 0 afterwards. Since placeholder never appears in training
+        sentences, we approximate by giving it pdiscard=0 (always discarded
+        if encountered) which has the same no-op effect."""
+        counts = self.counts.copy()
+        counts[0] = int(1e18)                          # match C++ placeholder count
+        f = counts / max(self.ntokens, 1)
         with np.errstate(divide="ignore", invalid="ignore"):
             p = np.sqrt(self.t / f) + self.t / f
-        p[0] = 1.0                                     # placeholder always kept
         return p.astype(np.float32)
 
     def tokenise(self, tokens: list[str]) -> tuple[np.ndarray, np.ndarray]:
         """Map raw tokens → (word_ids, hashes) as int32 arrays.
-        Unknown words are silently skipped."""
+        Unknown words and </s> are silently skipped (matches C++ SKIP_EOS|SKIP_OOV)."""
         w2i, whash = self.w2i, self.whash
         ids, hashes = [], []
         for tok in tokens:
+            if tok == "</s>":
+                break                                  # SKIP_EOS: stop on EOS
             wid = w2i.get(tok, -1)
             if wid >= 0:
                 ids.append(wid)
@@ -491,8 +508,13 @@ class Sent2Vec:
         tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
+        ep = 0
 
-        for ep in range(self.epoch):
+        # C++ loops: while tokenCount < epoch * ntokens, wrapping file at EOF.
+        # Since ntokens includes </s> but training tokens don't, this requires
+        # more than `epoch` passes. We call _train_epoch (one full pass per call)
+        # in a while-loop until tok_count reaches total.
+        while tok_count < np.int64(total):
             loss, steps, tok_count, rng_state, rng_discard = _train_epoch(
                 self.wi, self.wo, flat_ids, flat_hashes, offsets,
                 np.int32(n_sentences), pdiscard, neg_table,
@@ -503,13 +525,14 @@ class Sent2Vec:
                 tok_count, _SIG, _LOG)
             loss_acc += float(loss)
             n_acc += int(steps)
+            ep += 1
 
             if self.verbose > 0:
                 elapsed = max(time.time() - t0, 1e-6)
                 wps = int(tok_count) / elapsed
-                pct = int(tok_count) / total * 100
+                pct = min(int(tok_count) / total * 100, 100.0)
                 avg = loss_acc / max(n_acc, 1)
-                print(f"\r{pct:5.1f}%  {wps:,.0f} w/s  ep={ep+1}/{self.epoch}"
+                print(f"\r{pct:5.1f}%  {wps:,.0f} w/s  pass={ep}"
                       f"  loss={avg:.4f}",
                       end="", file=sys.stderr)
 

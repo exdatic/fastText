@@ -395,7 +395,7 @@ class Sent2Vec:
         wi    = (rng.uniform(-1, 1, (n_in, dim)) / dim).astype(np.float32)
         wo    = np.zeros((n_out, dim), np.float32)
 
-        neg_table = _build_neg_table(vocab.counts[1:])  # skip placeholder
+        neg_table = _build_neg_table(vocab.counts)  # includes placeholder (count=0)
 
         model = cls(vocab=vocab, wi=wi, wo=wo, dim=dim, neg=neg, lr=lr,
                     word_ngrams=word_ngrams, dropout_k=dropout_k,
@@ -469,14 +469,18 @@ class Sent2Vec:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+_NEG_TABLE_SIZE = 10_000_000
+
 def _build_neg_table(counts: np.ndarray) -> np.ndarray:
-    """Build negative-sampling table, sized proportionally to vocab."""
-    sqrt_c = np.sqrt(counts.astype(np.float64))
-    prob = sqrt_c / sqrt_c.sum()
-    cum = np.cumsum(prob)
-    size = int(min(max(len(counts) * 1000, 100_000), 10_000_000))
-    table = np.searchsorted(cum, np.linspace(0, 1, size, endpoint=False))
-    return np.clip(table, 0, len(counts) - 1).astype(np.int32) + 1  # +1 skip placeholder
+    """Build negative-sampling table — matches C++ NegativeSamplingLoss exactly.
+
+    counts includes placeholder at index 0 (count=0).
+    Table stores 0-based word indices; placeholder gets 0 entries."""
+    sqrt_c = np.power(counts.astype(np.float64), 0.5)
+    z = sqrt_c.sum()
+    # each word i gets floor(sqrt(c_i) * TABLE_SIZE / z) entries — matches C++ loop
+    slots = (sqrt_c * _NEG_TABLE_SIZE / z).astype(np.intp)
+    return np.repeat(np.arange(len(counts), dtype=np.int32), slots)
 
 def _progress(tok, total, t0, lr, loss, n):
     pct = tok / total * 100

@@ -575,6 +575,101 @@ class StarSpace:
 
     # ── training ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _build_vocab_and_cache(data, cache_dir, *, min_count=1,
+                               bucket=2_000_000, word_ngrams=1,
+                               label_prefix="__label__", verbose=2):
+        """Single pass over *data*: count frequencies + write provisional ID cache.
+
+        Writes ``prov.bin`` (int32 per token) and ``off.bin`` (int64 per line)
+        to *cache_dir*.
+
+        Returns ``(vocab, remap, final_hash)`` where *remap[prov_id]* gives
+        the final embedding index (or -1 if filtered by min_count) and
+        *final_hash[final_word_id]* gives the FNV-1a hash.
+        """
+        tok2prov: dict[str, int] = {}
+        prov_is_label: list[bool] = []
+        prov_hash: list[int] = []
+        prov_freq: list[int] = []
+
+        prov_path = os.path.join(cache_dir, "prov.bin")
+        off_path = os.path.join(cache_dir, "off.bin")
+        f_prov = open(prov_path, "wb")
+        f_off = open(off_path, "wb")
+        f_off.write(np.int64(0).tobytes())
+
+        ntokens = 0
+        for tokens in data:
+            for tok in tokens:
+                ntokens += 1
+                pid = tok2prov.get(tok)
+                if pid is None:
+                    pid = len(tok2prov)
+                    tok2prov[tok] = pid
+                    is_lbl = tok.startswith(label_prefix)
+                    prov_is_label.append(is_lbl)
+                    prov_hash.append(
+                        0 if is_lbl else int(_fnv1a_bytes(
+                            np.frombuffer(tok.encode("utf-8"),
+                                          dtype=np.uint8))))
+                    prov_freq.append(0)
+                prov_freq[pid] += 1
+                f_prov.write(np.int32(pid).tobytes())
+            f_off.write(np.int64(f_prov.tell() // 4).tobytes())
+            if verbose > 1 and ntokens % 1_000_000 == 0:
+                print(f"\rRead {ntokens // 1_000_000}M words",
+                      end="", file=sys.stderr)
+
+        f_prov.close()
+        f_off.close()
+
+        # Separate surviving words and labels, sorted by frequency desc
+        prov2str = {v: k for k, v in tok2prov.items()}
+
+        word_items: list[tuple[int, str, int]] = []
+        label_items: list[tuple[int, str, int]] = []
+        for pid in range(len(prov_freq)):
+            s = prov2str[pid]
+            if prov_is_label[pid]:
+                label_items.append((pid, s, prov_freq[pid]))
+            elif prov_freq[pid] >= min_count:
+                word_items.append((pid, s, prov_freq[pid]))
+
+        word_items.sort(key=lambda x: -x[2])
+        label_items.sort(key=lambda x: -x[2])
+
+        words = [s for _, s, _ in word_items]
+        labels = [s for _, s, _ in label_items]
+        nwords = len(words)
+
+        # Remap: prov_id → final embedding index, -1 for filtered
+        remap = np.full(len(tok2prov), -1, dtype=np.int32)
+        for final_wid, (pid, _, _) in enumerate(word_items):
+            remap[pid] = final_wid
+        for final_lid, (pid, _, _) in enumerate(label_items):
+            remap[pid] = nwords + final_lid
+
+        # Hash table: final_word_id → fnv1a
+        final_hash = np.array([prov_hash[pid] for pid, _, _ in word_items],
+                              dtype=np.int32)
+
+        w2i = {w: i for i, w in enumerate(words)}
+        l2i = {l: i for i, l in enumerate(labels)}
+        whash = {words[i]: int(final_hash[i]) for i in range(nwords)}
+        bkt = bucket if word_ngrams > 1 else 0
+
+        if verbose > 0:
+            print(f"\rRead {ntokens // 1_000_000}M words — "
+                  f"vocab {nwords} words, {len(labels)} labels "
+                  f"(min_count={min_count})", file=sys.stderr)
+
+        vocab = Vocab(words=words, labels=labels, w2i=w2i, l2i=l2i,
+                      whash=whash, ntokens=ntokens, bucket=bkt,
+                      word_ngrams=word_ngrams, label_prefix=label_prefix)
+
+        return vocab, remap, final_hash
+
     @classmethod
     def train(cls, data, *, dim=100, epoch=5, lr=0.01,
               margin=0.05, neg_search_limit=50, min_count=1,
@@ -592,25 +687,15 @@ class StarSpace:
         *train_mode* selects the LHS/RHS construction (0-5).
         *ws* is the context window size for trainMode 5.
         """
-        # Normalise data to a path so we can iterate cheaply twice.
-        cleanup = None
         if isinstance(data, str):
-            data_path = data
-        else:
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", delete=False, prefix="ss_src_")
-            for tokens in data:
-                tmp.write(" ".join(tokens) + "\n")
-            tmp.close()
-            data_path = tmp.name
-            cleanup = tmp.name
+            data = iter_lines(data)
 
+        cache_dir = tempfile.mkdtemp(prefix="ss_")
         try:
-            vocab = Vocab.build(iter_lines(data_path), min_count=min_count,
-                                bucket=bucket, word_ngrams=word_ngrams,
-                                verbose=verbose)
+            vocab, remap, final_hash = cls._build_vocab_and_cache(
+                data, cache_dir, min_count=min_count, bucket=bucket,
+                word_ngrams=word_ngrams, verbose=verbose)
 
-            # Shared embedding: [words | labels | n-gram buckets]
             n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
             rng = np.random.RandomState(seed)
             emb = (rng.normal(0, init_rand_sd, (n_emb, dim))).astype(
@@ -621,27 +706,43 @@ class StarSpace:
                         neg_search_limit=neg_search_limit,
                         lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
                         verbose=verbose, train_mode=train_mode, ws=ws)
-            model._fit(iter_lines(data_path))
+            model._fit(cache_dir, remap, final_hash)
         finally:
-            if cleanup:
+            for fn in os.listdir(cache_dir):
                 try:
-                    os.unlink(cleanup)
+                    os.unlink(os.path.join(cache_dir, fn))
                 except OSError:
                     pass
+            try:
+                os.rmdir(cache_dir)
+            except OSError:
+                pass
 
         return model
 
-    def _fit(self, data: Iterable[list[str]]):
+    def _fit(self, cache_dir, remap, final_hash):
         v = self.vocab
         total = self.epoch * v.ntokens
         rng_state = np.int64(self.seed + 1)
         mode = self.train_mode
+        nw = v.nwords
 
-        # AdaGrad accumulator (per-row)
         adagrad = np.zeros(self.emb.shape[0], np.float32)
 
-        # ── Tokenise + mode conversion → stream to temp binary mmap ──
-        tmp_dir = tempfile.mkdtemp(prefix="ss_")
+        def _mmap_or_empty(p, dt):
+            if os.path.getsize(p) == 0:
+                return np.empty(0, dtype=dt)
+            return np.memmap(p, dtype=dt, mode="r")
+
+        # ── Read provisional cache ──
+        prov_ids = _mmap_or_empty(
+            os.path.join(cache_dir, "prov.bin"), np.int32)
+        line_offsets = _mmap_or_empty(
+            os.path.join(cache_dir, "off.bin"), np.int64)
+        n_lines = len(line_offsets) - 1
+
+        # ── Build training mmaps from cache + remap ──
+        tmp_dir = tempfile.mkdtemp(prefix="ss_tr_")
         names = ("ids", "hash", "lbl", "extra", "ioff", "loff", "eoff", "neg")
         paths = {n: os.path.join(tmp_dir, f"{n}.bin") for n in names}
 
@@ -652,16 +753,34 @@ class StarSpace:
 
         rng_py = _random.Random(self.seed)
 
-        for tokens in data:
-            word_ids, word_hashes, label_ids = v.tokenise_line(tokens)
-            nw = len(word_ids)
+        for li in range(n_lines):
+            start = int(line_offsets[li])
+            end = int(line_offsets[li + 1])
+
+            # Remap provisional IDs → (word_ids, word_hashes, label_ids)
+            word_ids_l: list[int] = []
+            word_hashes_l: list[int] = []
+            label_ids_l: list[int] = []
+            for j in range(start, end):
+                fid = int(remap[prov_ids[j]])
+                if fid < 0:
+                    continue
+                if fid < nw:
+                    word_ids_l.append(fid)
+                    word_hashes_l.append(int(final_hash[fid]))
+                else:
+                    label_ids_l.append(fid)
+
+            word_ids = np.array(word_ids_l, dtype=np.int32)
+            word_hashes = np.array(word_hashes_l, dtype=np.int32)
+            label_ids = np.array(label_ids_l, dtype=np.int32)
+            nw_line = len(word_ids)
             nl = len(label_ids)
 
             if mode == 5:
-                # Word embedding: expand into (context, target) pairs
-                for wi in range(nw):
+                for wi in range(nw_line):
                     ctx_start = max(0, wi - self.ws)
-                    ctx_end = min(nw, wi + self.ws + 1)
+                    ctx_end = min(nw_line, wi + self.ws + 1)
                     ctx_w = []
                     ctx_h = []
                     for ci in range(ctx_start, ctx_end):
@@ -676,7 +795,7 @@ class StarSpace:
                     f["ids"].write(cw.tobytes())
                     f["hash"].write(ch.tobytes())
                     f["lbl"].write(tw.tobytes())
-                    f["extra"].write(b"")  # no extra LHS
+                    f["extra"].write(b"")
                     f["ioff"].write(np.int64(
                         f["ids"].tell() // 4).tobytes())
                     f["loff"].write(np.int64(
@@ -687,13 +806,13 @@ class StarSpace:
                 continue
 
             if mode == 0:
-                if nw == 0 or nl == 0:
+                if nw_line == 0 or nl == 0:
                     continue
                 lhs_w, lhs_h = word_ids, word_hashes
                 lhs_extra = np.empty(0, np.int32)
                 rhs = label_ids
             elif mode == 1:
-                if nw == 0 or nl < 2:
+                if nw_line == 0 or nl < 2:
                     continue
                 idx = rng_py.randrange(nl)
                 lhs_w, lhs_h = word_ids, word_hashes
@@ -702,7 +821,7 @@ class StarSpace:
                     dtype=np.int32)
                 rhs = np.array([label_ids[idx]], dtype=np.int32)
             elif mode == 2:
-                if nw == 0 or nl < 2:
+                if nw_line == 0 or nl < 2:
                     continue
                 idx = rng_py.randrange(nl)
                 lhs_w, lhs_h = word_ids, word_hashes
@@ -738,13 +857,10 @@ class StarSpace:
             f["eoff"].write(np.int64(f["extra"].tell() // 4).tobytes())
             f["neg"].write(rhs.tobytes())
 
+        del prov_ids, line_offsets
+
         for fh in f.values():
             fh.close()
-
-        def _mmap_or_empty(p, dt):
-            if os.path.getsize(p) == 0:
-                return np.empty(0, dtype=dt)
-            return np.memmap(p, dtype=dt, mode="r")
 
         flat_ids = _mmap_or_empty(paths["ids"], np.int32)
         flat_hashes = _mmap_or_empty(paths["hash"], np.int32)
@@ -760,9 +876,7 @@ class StarSpace:
         if n_examples == 0 or neg_pool_size == 0:
             if self.verbose > 0:
                 print("No training examples.", file=sys.stderr)
-            self._cleanup_mmap(paths, tmp_dir, [
-                flat_ids, flat_hashes, flat_labels, flat_extra,
-                input_offsets, label_offsets, extra_offsets, neg_pool])
+            self._cleanup_dir(tmp_dir)
             return
 
         multi_rhs = np.int32(1) if mode == 2 else np.int32(0)
@@ -802,17 +916,15 @@ class StarSpace:
             print(f"\rDone — avg loss {avg:.4f}"
                   f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
 
-        self._cleanup_mmap(paths, tmp_dir, [
-            flat_ids, flat_hashes, flat_labels, flat_extra,
-            input_offsets, label_offsets, extra_offsets, neg_pool])
+        del flat_ids, flat_hashes, flat_labels, flat_extra
+        del input_offsets, label_offsets, extra_offsets, neg_pool
+        self._cleanup_dir(tmp_dir)
 
     @staticmethod
-    def _cleanup_mmap(paths, tmp_dir, arrays):
-        for a in arrays:
-            del a
-        for p in paths.values():
+    def _cleanup_dir(tmp_dir):
+        for fn in os.listdir(tmp_dir):
             try:
-                os.unlink(p)
+                os.unlink(os.path.join(tmp_dir, fn))
             except OSError:
                 pass
         try:

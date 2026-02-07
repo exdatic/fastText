@@ -1,249 +1,240 @@
 """
 sent2vec -- Pure Python implementation using NumPy and Numba.
 
-A faithful port of the C++ sent2vec / fastText codebase, supporting:
-  - Training sent2vec models from a text corpus
-  - Loading / saving binary models (compatible with the C++ format)
-  - Computing sentence embeddings from trained models
+Supports training sent2vec models, loading/saving binary models (compatible
+with the C++ fasttext format), and computing sentence embeddings.
 
-Usage examples:
-  # Train a model
-  model = Sent2Vec()
-  model.train("corpus.txt", "my_model", dim=100, epoch=5)
+    >>> model = Sent2Vec.train("corpus.txt", dim=100, epoch=5)
+    >>> model.save("my_model.bin")
 
-  # Load a pretrained model and embed sentences
-  model = Sent2Vec()
-  model.load_model("my_model.bin")
-  vec = model.get_sentence_vector("hello world")
+    >>> model = Sent2Vec.load("my_model.bin")
+    >>> vec = model.embed("hello world")
+    >>> vecs = model.embed(["sentence one", "sentence two"])
 
 Copyright (c) 2016-present, Facebook, Inc.  (original C++ code)
 Python port follows the MIT license of the original project.
 """
 
+from __future__ import annotations
+
+import argparse
+import math
 import struct
 import sys
 import time
-import math
-from pathlib import Path
+from dataclasses import dataclass, field
 
 import numpy as np
-from numba import njit, types, int32, int64, float32, float64, boolean
-from numba.typed import List as NumbaList
+from numba import njit
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-FASTTEXT_VERSION = 12
-FASTTEXT_FILEFORMAT_MAGIC_INT32 = 793712314
-
-MAX_VOCAB_SIZE = 30_000_000
-MAX_LINE_SIZE = 1024
-
-SIGMOID_TABLE_SIZE = 512
-MAX_SIGMOID = 8
-LOG_TABLE_SIZE = 512
-
-NEGATIVE_TABLE_SIZE = 10_000_000
-
-# Model types (match C++ enum values)
-MODEL_CBOW = 1
-MODEL_SG = 2
-MODEL_SUP = 3
-MODEL_SENT2VEC = 4
-MODEL_PVDM = 5
-
-# Loss types
-LOSS_HS = 1
-LOSS_NS = 2
-LOSS_SOFTMAX = 3
-LOSS_OVA = 4
-
-# Entry types
-ENTRY_WORD = 0
-ENTRY_LABEL = 1
-
-# getLine flags
-SKIP_EOS = 0x01
-SKIP_OOV = 0x02
-SKIP_FRQ = 0x04
-SKIP_LNG = 0x08
-
-EOS = "</s>"
-BOW = "<"
-EOW = ">"
+_MAGIC = 793712314
+_VERSION = 12
+_MAX_VOCAB = 30_000_000
+_MAX_LINE = 1024
+_SIG_SIZE = 512
+_MAX_SIG = 8
+_LOG_SIZE = 512
+_NEG_TABLE = 10_000_000
+_WORD = 0
+_LABEL = 1
+_SENT2VEC = 4
+_NS = 2
 
 # ---------------------------------------------------------------------------
-# Numba-accelerated helper functions
+# Dataclasses
 # ---------------------------------------------------------------------------
 
-@njit(cache=True)
-def _fnv_hash(data):
-    """FNV hash matching the C++ fasttext implementation (signed char)."""
-    h = np.uint32(2166136261)
-    for i in range(len(data)):
-        # Cast to int8 then to uint32 to match C++ signed char behaviour
-        b = np.int8(data[i])
-        h = h ^ np.uint32(b)
-        h = np.uint32(h * np.uint32(16777619))
+@dataclass
+class Entry:
+    word: str
+    count: int
+    type: int          # _WORD or _LABEL
+    subwords: list[int] = field(default_factory=list)
+
+
+@dataclass
+class Args:
+    """Model hyperparameters. Fields serialised to the binary format are
+    marked with ``# [bin]``."""
+
+    dim: int = 100          # [bin]
+    ws: int = 5             # [bin]
+    epoch: int = 5          # [bin]
+    min_count: int = 5      # [bin]
+    neg: int = 10           # [bin]
+    word_ngrams: int = 1    # [bin]
+    loss: int = _NS         # [bin]
+    model: int = _SENT2VEC  # [bin]
+    bucket: int = 2_000_000 # [bin]
+    minn: int = 0           # [bin]
+    maxn: int = 0           # [bin]
+    lr_update_rate: int = 100  # [bin]
+    t: float = 1e-4         # [bin]
+
+    # Not in binary format -- runtime only
+    lr: float = 0.2
+    dropout_k: int = 2
+    min_count_label: int = 0
+    label_prefix: str = "__label__"
+    verbose: int = 2
+    seed: int = 0
+
+    # -- binary I/O (12 ints + 1 double = 56 bytes) --
+    _BIN_FMT = "<12id"
+
+    def to_bytes(self) -> bytes:
+        return struct.pack(
+            self._BIN_FMT,
+            self.dim, self.ws, self.epoch, self.min_count, self.neg,
+            self.word_ngrams, self.loss, self.model, self.bucket,
+            self.minn, self.maxn, self.lr_update_rate, self.t,
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Args":
+        vals = struct.unpack(cls._BIN_FMT, data)
+        return cls(
+            dim=vals[0], ws=vals[1], epoch=vals[2], min_count=vals[3],
+            neg=vals[4], word_ngrams=vals[5], loss=vals[6], model=vals[7],
+            bucket=vals[8], minn=vals[9], maxn=vals[10],
+            lr_update_rate=vals[11], t=vals[12],
+        )
+
+    BIN_SIZE = struct.calcsize(_BIN_FMT)  # 56
+
+
+# ---------------------------------------------------------------------------
+# FNV-1a hash (matching the C++ fasttext signed-char variant)
+# ---------------------------------------------------------------------------
+
+def _fnv(word: str) -> int:
+    """FNV hash compatible with the C++ fasttext implementation."""
+    h = 2166136261
+    for b in word.encode("utf-8"):
+        # Replicate C++ ``h ^ uint32_t(int8_t(c))``
+        sb = b if b < 128 else b - 256          # signed byte
+        h = (h ^ (sb & 0xFFFFFFFF)) & 0xFFFFFFFF
+        h = (h * 16777619) & 0xFFFFFFFF
     return h
 
 
+# ---------------------------------------------------------------------------
+# Numba kernels
+# ---------------------------------------------------------------------------
+
 @njit(cache=True)
 def _build_sigmoid_table():
-    table = np.empty(SIGMOID_TABLE_SIZE + 1, dtype=np.float32)
-    for i in range(SIGMOID_TABLE_SIZE + 1):
-        x = float(i) * 2.0 * MAX_SIGMOID / SIGMOID_TABLE_SIZE - MAX_SIGMOID
-        table[i] = 1.0 / (1.0 + math.exp(-x))
-    return table
+    t = np.empty(_SIG_SIZE + 1, dtype=np.float32)
+    for i in range(_SIG_SIZE + 1):
+        x = float(i) * 2.0 * _MAX_SIG / _SIG_SIZE - _MAX_SIG
+        t[i] = 1.0 / (1.0 + math.exp(-x))
+    return t
 
 
 @njit(cache=True)
 def _build_log_table():
-    table = np.empty(LOG_TABLE_SIZE + 1, dtype=np.float32)
-    for i in range(LOG_TABLE_SIZE + 1):
-        x = (float(i) + 1e-5) / LOG_TABLE_SIZE
-        table[i] = math.log(x)
-    return table
+    t = np.empty(_LOG_SIZE + 1, dtype=np.float32)
+    for i in range(_LOG_SIZE + 1):
+        x = (float(i) + 1e-5) / _LOG_SIZE
+        t[i] = math.log(x)
+    return t
+
+
+_SIGMOID_TABLE = _build_sigmoid_table()
+_LOG_TABLE = _build_log_table()
 
 
 @njit(cache=True)
-def _sigmoid(x, table):
-    if x < -MAX_SIGMOID:
+def _sigmoid(x):
+    if x < -_MAX_SIG:
         return np.float32(0.0)
-    elif x > MAX_SIGMOID:
+    if x > _MAX_SIG:
         return np.float32(1.0)
-    else:
-        i = int((x + MAX_SIGMOID) * SIGMOID_TABLE_SIZE / MAX_SIGMOID / 2)
-        return table[i]
+    return _SIGMOID_TABLE[int((x + _MAX_SIG) * _SIG_SIZE / _MAX_SIG / 2)]
 
 
 @njit(cache=True)
-def _log(x, table):
+def _log(x):
     if x > 1.0:
         return np.float32(0.0)
-    i = int(x * LOG_TABLE_SIZE)
-    return table[i]
+    return _LOG_TABLE[int(x * _LOG_SIZE)]
 
 
 @njit(cache=True)
-def _dot_row(matrix, vec, i, n):
-    d = np.float32(0.0)
-    offset = i * n
-    for j in range(n):
-        d += matrix[offset + j] * vec[j]
-    return d
+def _dot(a, b):
+    s = np.float32(0.0)
+    for i in range(len(a)):
+        s += a[i] * b[i]
+    return s
 
 
 @njit(cache=True)
-def _add_row_to_vec(matrix, vec, i, n):
-    offset = i * n
-    for j in range(n):
-        vec[j] += matrix[offset + j]
+def _binary_logistic(wo, hidden, grad, target, positive, lr, dim):
+    score = _sigmoid(_dot(wo[target], hidden))
+    alpha = np.float32(lr * (np.float32(positive) - score))
+    grad += alpha * wo[target]
+    wo[target] += alpha * hidden
+    if positive:
+        return -_log(score)
+    return -_log(np.float32(1.0) - score)
 
 
 @njit(cache=True)
-def _add_row_to_vec_scaled(matrix, vec, i, n, a):
-    offset = i * n
-    for j in range(n):
-        vec[j] += a * matrix[offset + j]
+def _ns_update(wi, wo, input_ids, target, neg, negatives,
+               dim, lr, normalize_gradient, rng_state):
+    """Negative-sampling forward + backward for one training example.
 
+    Args:
+        wi: input embeddings  (n_input, dim)
+        wo: output embeddings (n_output, dim)
+        input_ids: int32 array of context token indices
+        target: positive target word index
+        neg: number of negative samples
+        negatives: int32 negative-sampling table
+        dim: embedding dimension
+        lr: current learning rate
+        normalize_gradient: whether to normalise gradient by input size
+        rng_state: minstd_rand state (int64)
 
-@njit(cache=True)
-def _add_vec_to_row(matrix, vec, i, n, a):
-    offset = i * n
-    for j in range(n):
-        matrix[offset + j] += a * vec[j]
-
-
-@njit(cache=True)
-def _compute_hidden(wi, input_ids, hidden, dim):
-    """Average the input embedding rows into hidden."""
+    Returns:
+        (loss, rng_state)
+    """
     n = len(input_ids)
     if n == 0:
-        return
-    for j in range(dim):
-        hidden[j] = np.float32(0.0)
-    for k in range(n):
-        idx = input_ids[k]
-        offset = idx * dim
-        for j in range(dim):
-            hidden[j] += wi[offset + j]
-    inv = np.float32(1.0 / n)
-    for j in range(dim):
-        hidden[j] *= inv
-
-
-@njit(cache=True)
-def _binary_logistic(wo, hidden, grad, target, label_positive, lr, dim,
-                     sigmoid_table, log_table, backprop):
-    """Binary logistic loss for a single target. Returns loss."""
-    score = _sigmoid(_dot_row(wo, hidden, target, dim), sigmoid_table)
-    if backprop:
-        alpha = np.float32(lr * (np.float32(label_positive) - score))
-        _add_row_to_vec_scaled(wo, grad, target, dim, alpha)
-        _add_vec_to_row(wo, hidden, target, dim, alpha)
-    if label_positive:
-        return -_log(score, log_table)
-    else:
-        return -_log(np.float32(1.0) - score, log_table)
-
-
-@njit(cache=True)
-def _negative_sampling_forward(wo, wi, hidden, grad, input_ids,
-                               target, neg, negatives, neg_size,
-                               dim, lr, sigmoid_table, log_table,
-                               normalize_gradient, rng_state):
-    """Full forward + backward pass for negative sampling loss.
-
-    Returns (loss, rng_state).
-    """
-    n_input = len(input_ids)
-    if n_input == 0:
         return np.float32(0.0), rng_state
 
-    # compute hidden = average of input rows
-    _compute_hidden(wi, input_ids, hidden, dim)
+    # hidden = mean of input rows
+    hidden = np.zeros(dim, dtype=np.float32)
+    for k in range(n):
+        hidden += wi[input_ids[k]]
+    hidden *= np.float32(1.0 / n)
 
-    # zero grad
-    for j in range(dim):
-        grad[j] = np.float32(0.0)
+    grad = np.zeros(dim, dtype=np.float32)
 
-    # positive sample
-    loss = _binary_logistic(wo, hidden, grad, target, True, lr, dim,
-                            sigmoid_table, log_table, True)
+    # positive
+    loss = _binary_logistic(wo, hidden, grad, target, True, lr, dim)
 
-    # negative samples
+    # negatives
+    neg_size = len(negatives)
     for _ in range(neg):
-        # LCG matching std::minstd_rand
         rng_state = np.int64((rng_state * 48271) % 2147483647)
-        neg_idx = int(np.uint64(rng_state) % np.uint64(neg_size))
-        negative = negatives[neg_idx]
+        negative = negatives[int(np.uint64(rng_state) % np.uint64(neg_size))]
         while negative == target:
             rng_state = np.int64((rng_state * 48271) % 2147483647)
-            neg_idx = int(np.uint64(rng_state) % np.uint64(neg_size))
-            negative = negatives[neg_idx]
-        loss += _binary_logistic(wo, hidden, grad, negative, False, lr, dim,
-                                 sigmoid_table, log_table, True)
+            negative = negatives[int(np.uint64(rng_state) % np.uint64(neg_size))]
+        loss += _binary_logistic(wo, hidden, grad, negative, False, lr, dim)
 
-    # normalise gradient if needed
-    if normalize_gradient and n_input > 0:
-        inv = np.float32(1.0 / n_input)
-        for j in range(dim):
-            grad[j] *= inv
-
-    # update input embeddings
-    for k in range(n_input):
-        idx = input_ids[k]
-        _add_vec_to_row(wi, grad, idx, dim, np.float32(1.0))
+    # normalise and propagate to input
+    if normalize_gradient:
+        grad *= np.float32(1.0 / n)
+    for k in range(n):
+        wi[input_ids[k]] += grad
 
     return loss, rng_state
-
-
-@njit(cache=True)
-def _discard_prob(count, ntokens, t):
-    f = float(count) / float(ntokens)
-    return math.sqrt(t / f) + t / f
 
 
 # ---------------------------------------------------------------------------
@@ -251,869 +242,574 @@ def _discard_prob(count, ntokens, t):
 # ---------------------------------------------------------------------------
 
 class Dictionary:
-    """Vocabulary manager with hashing, subword n-grams, and word n-grams."""
+    """Vocabulary with hashing, subword n-grams, and word n-grams."""
 
-    def __init__(self, args):
+    def __init__(self, args: Args):
         self.args = args
-        self.word2int = np.full(MAX_VOCAB_SIZE, -1, dtype=np.int32)
-        self.words = []   # list of dicts: {word, count, type, subwords}
-        self.pdiscard = np.empty(0, dtype=np.float32)
-        self.size = 0
-        self.nwords_ = 0
-        self.nlabels_ = 0
-        self.ntokens_ = 0
-        self.pruneidx_size = -1
-        self.pruneidx = {}
+        self._w2i: np.ndarray = np.full(_MAX_VOCAB, -1, dtype=np.int32)
+        self.entries: list[Entry] = []
+        self.pdiscard: np.ndarray = np.empty(0, dtype=np.float32)
+        self.nwords: int = 0
+        self.nlabels: int = 0
+        self.ntokens: int = 0
+        self._pruneidx: dict[int, int] = {}
+        self._pruneidx_size: int = -1
 
-    # -- hashing --
-    @staticmethod
-    def hash(word):
-        data = word.encode('utf-8')
-        h = np.uint32(2166136261)
-        with np.errstate(over='ignore'):
-            for b in data:
-                h = h ^ np.uint32(np.int8(b))
-                h = np.uint32(h * np.uint32(16777619))
-        return int(h)
+    # -- hash / lookup -------------------------------------------------------
 
-    def find(self, word, h=None):
+    def _slot(self, word: str, h: int | None = None) -> int:
         if h is None:
-            h = self.hash(word)
-        word2intsize = len(self.word2int)
-        idx = int(h % word2intsize)
-        while self.word2int[idx] != -1 and self.words[self.word2int[idx]]['word'] != word:
-            idx = (idx + 1) % word2intsize
+            h = _fnv(word)
+        sz = len(self._w2i)
+        idx = h % sz
+        while self._w2i[idx] != -1 and self.entries[self._w2i[idx]].word != word:
+            idx = (idx + 1) % sz
         return idx
 
-    def add(self, word):
-        h = self.find(word)
-        self.ntokens_ += 1
-        if self.word2int[h] == -1:
-            entry = {
-                'word': word,
-                'count': 1,
-                'type': ENTRY_LABEL if word.startswith(self.args['label']) else ENTRY_WORD,
-                'subwords': [],
-            }
-            self.words.append(entry)
-            self.word2int[h] = self.size
-            self.size += 1
+    def get_id(self, word: str, h: int | None = None) -> int:
+        return int(self._w2i[self._slot(word, h)])
+
+    # -- build ---------------------------------------------------------------
+
+    def _add(self, word: str):
+        slot = self._slot(word)
+        self.ntokens += 1
+        if self._w2i[slot] == -1:
+            etype = _LABEL if word.startswith(self.args.label_prefix) else _WORD
+            self.entries.append(Entry(word, 1, etype))
+            self._w2i[slot] = len(self.entries) - 1
         else:
-            self.words[self.word2int[h]]['count'] += 1
+            self.entries[self._w2i[slot]].count += 1
 
-    def get_id(self, word, h=None):
-        idx = self.find(word, h)
-        return int(self.word2int[idx])
+    def read_from_file(self, path: str):
+        min_thr = 1
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                for tok in raw.split():
+                    self._add(tok)
+                    if self.ntokens % 1_000_000 == 0 and self.args.verbose > 1:
+                        sys.stderr.write(f"\rRead {self.ntokens // 1_000_000}M words")
+                        sys.stderr.flush()
+                    if len(self.entries) > 0.75 * _MAX_VOCAB:
+                        min_thr += 1
+                        self._threshold(min_thr, min_thr)
+                self._add("</s>")
 
-    def get_type(self, id_or_word):
-        if isinstance(id_or_word, str):
-            return ENTRY_LABEL if id_or_word.startswith(self.args['label']) else ENTRY_WORD
-        return self.words[id_or_word]['type']
+        # sent2vec placeholder
+        if self.args.model == _SENT2VEC:
+            slot = self._slot("<PLACEHOLDER>")
+            self.entries.append(Entry("<PLACEHOLDER>", int(1e18), _WORD))
+            self._w2i[slot] = len(self.entries) - 1
 
-    def nwords(self):
-        return self.nwords_
+        self._threshold(self.args.min_count, self.args.min_count_label)
+        self._init_discard()
+        self._init_ngrams()
 
-    def nlabels(self):
-        return self.nlabels_
+        if self.args.model == _SENT2VEC:
+            assert self.entries[0].word == "<PLACEHOLDER>"
+            self.entries[0].count = 0
 
-    def ntokens(self):
-        return self.ntokens_
-
-    def get_word(self, wid):
-        return self.words[wid]['word']
-
-    def get_token_count(self, wid):
-        return self.words[wid]['count']
-
-    # -- discard --
-    def discard(self, wid, rand_val):
-        if self.args['model'] == MODEL_SUP:
-            return False
-        return rand_val > self.pdiscard[wid]
-
-    def init_table_discard(self):
-        self.pdiscard = np.empty(self.size, dtype=np.float32)
-        for i in range(self.size):
-            c = self.words[i]['count']
-            if c <= 0 or self.ntokens_ <= 0:
-                self.pdiscard[i] = 1.0
-            else:
-                f = float(c) / float(self.ntokens_)
-                self.pdiscard[i] = math.sqrt(self.args['t'] / f) + self.args['t'] / f
-
-    # -- subwords --
-    def compute_subwords(self, word):
-        ngrams = []
-        minn = self.args['minn']
-        maxn = self.args['maxn']
-        if maxn <= 0:
-            return ngrams
-        word_bytes = word.encode('utf-8')
-        # walk over UTF-8 characters
-        char_starts = []
-        i = 0
-        while i < len(word_bytes):
-            char_starts.append(i)
-            if (word_bytes[i] & 0xC0) == 0x80:
-                i += 1
-                continue
-            i += 1
-            while i < len(word_bytes) and (word_bytes[i] & 0xC0) == 0x80:
-                i += 1
-        char_starts.append(len(word_bytes))  # sentinel
-
-        for ci in range(len(char_starts) - 1):
-            if (word_bytes[char_starts[ci]] & 0xC0) == 0x80:
-                continue
-            for n in range(1, maxn + 1):
-                end_ci = ci + n
-                if end_ci >= len(char_starts):
-                    break
-                if n >= minn and not (n == 1 and (ci == 0 or end_ci == len(char_starts) - 1)):
-                    ngram = word_bytes[char_starts[ci]:char_starts[end_ci]]
-                    h = self.hash(ngram.decode('utf-8', errors='replace')) % self.args['bucket']
-                    self.push_hash(ngrams, h)
-        return ngrams
-
-    def init_ngrams(self):
-        for i in range(self.size):
-            word = BOW + self.words[i]['word'] + EOW
-            self.words[i]['subwords'] = [i]
-            if self.words[i]['word'] != EOS:
-                self.words[i]['subwords'].extend(self.compute_subwords(word))
-
-    def get_subwords_by_id(self, wid):
-        return self.words[wid]['subwords']
-
-    def get_subwords(self, word):
-        wid = self.get_id(word)
-        if wid >= 0:
-            return list(self.words[wid]['subwords'])
-        ngrams = []
-        if word != EOS:
-            ngrams = self.compute_subwords(BOW + word + EOW)
-        return ngrams
-
-    def push_hash(self, hashes, id_val):
-        if self.pruneidx_size == 0 or id_val < 0:
-            return
-        if self.pruneidx_size > 0:
-            if id_val in self.pruneidx:
-                id_val = self.pruneidx[id_val]
-            else:
-                return
-        hashes.append(self.nwords_ + self.nlabels_ + id_val)
-
-    # -- word n-grams --
-    def add_word_ngrams(self, line, hashes, n):
-        for i in range(len(hashes)):
-            h = np.uint64(hashes[i])
-            for j in range(i + 1, min(len(hashes), i + n)):
-                h = np.uint64(h * np.uint64(116049371) + np.uint64(hashes[j]))
-                bucket_id = int(h % np.uint64(self.args['bucket']))
-                self.push_hash(line, bucket_id)
-
-    def add_word_ngrams_dropout(self, line, hashes, n, k, rng):
-        size = len(hashes)
-        if size <= 2:
-            return
-        discard = [False] * size
-        num_discarded = 0
-        while num_discarded < k and size - num_discarded > 2:
-            token_to_discard = rng.randint(1, size - 1)
-            if not discard[token_to_discard]:
-                discard[token_to_discard] = True
-                num_discarded += 1
-        for i in range(size):
-            if discard[i]:
-                continue
-            h = np.uint64(hashes[i])
-            for j in range(i + 1, min(size, i + n)):
-                if discard[j]:
-                    break
-                h = np.uint64(h * np.uint64(116049371) + np.uint64(hashes[j]))
-                bucket_id = int(h % np.uint64(self.args['bucket']))
-                self.push_hash(line, bucket_id)
-
-    # -- reading --
-    @staticmethod
-    def read_words(text):
-        """Yield words from text line-by-line, inserting EOS at newlines."""
-        for line in text.split('\n'):
-            tokens = line.split()
-            for t in tokens:
-                yield t
-            yield EOS
-
-    def read_from_file(self, filepath):
-        min_threshold = 1
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            text = f.read()
-        for word in self.read_words(text):
-            self.add(word)
-            if self.ntokens_ % 1_000_000 == 0 and self.args.get('verbose', 2) > 1:
-                sys.stderr.write(f"\rRead {self.ntokens_ // 1_000_000}M words")
-                sys.stderr.flush()
-            if self.size > 0.75 * MAX_VOCAB_SIZE:
-                min_threshold += 1
-                self.threshold(min_threshold, min_threshold)
-
-        # Add placeholder for sent2vec
-        if self.args['model'] == MODEL_SENT2VEC:
-            h = self.find("<PLACEHOLDER>")
-            entry = {
-                'word': '<PLACEHOLDER>',
-                'count': int(1e18),
-                'type': ENTRY_WORD,
-                'subwords': [],
-            }
-            self.words.append(entry)
-            self.word2int[h] = self.size
-            self.size += 1
-
-        self.threshold(self.args['minCount'], self.args.get('minCountLabel', 0))
-        self.init_table_discard()
-        self.init_ngrams()
-
-        # Zero-out placeholder count so it doesn't affect discard
-        if self.args['model'] == MODEL_SENT2VEC:
-            assert self.words[0]['word'] == '<PLACEHOLDER>'
-            self.words[0]['count'] = 0
-
-        if self.args.get('verbose', 2) > 0:
-            sys.stderr.write(f"\rRead {self.ntokens_ // 1_000_000}M words\n")
-            sys.stderr.write(f"Number of words:  {self.nwords_}\n")
-            sys.stderr.write(f"Number of labels: {self.nlabels_}\n")
+        if self.args.verbose > 0:
+            sys.stderr.write(
+                f"\rRead {self.ntokens // 1_000_000}M words\n"
+                f"Number of words:  {self.nwords}\n"
+                f"Number of labels: {self.nlabels}\n")
             sys.stderr.flush()
 
-        if self.size == 0:
-            raise ValueError("Empty vocabulary. Try a smaller -minCount value.")
+    def _threshold(self, tw: int, tl: int):
+        self.entries.sort(key=lambda e: (e.type, -e.count))
+        self.entries = [e for e in self.entries
+                        if not ((e.type == _WORD and e.count < tw)
+                                or (e.type == _LABEL and e.count < tl))]
+        self.nwords = sum(1 for e in self.entries if e.type == _WORD)
+        self.nlabels = sum(1 for e in self.entries if e.type == _LABEL)
+        self._w2i = np.full(_MAX_VOCAB, -1, dtype=np.int32)
+        for i, e in enumerate(self.entries):
+            self._w2i[self._slot(e.word)] = i
 
-    def threshold(self, t, tl):
-        # Sort: words first (by count desc), then labels (by count desc)
-        self.words.sort(key=lambda e: (e['type'], -e['count']))
-        self.words = [e for e in self.words
-                      if not ((e['type'] == ENTRY_WORD and e['count'] < t) or
-                              (e['type'] == ENTRY_LABEL and e['count'] < tl))]
-        self.size = 0
-        self.nwords_ = 0
-        self.nlabels_ = 0
-        self.word2int = np.full(MAX_VOCAB_SIZE, -1, dtype=np.int32)
-        for entry in self.words:
-            h = self.find(entry['word'])
-            self.word2int[h] = self.size
-            self.size += 1
-            if entry['type'] == ENTRY_WORD:
-                self.nwords_ += 1
+    def _init_discard(self):
+        n = len(self.entries)
+        self.pdiscard = np.ones(n, dtype=np.float32)
+        for i, e in enumerate(self.entries):
+            if e.count > 0 and self.ntokens > 0:
+                f = e.count / self.ntokens
+                self.pdiscard[i] = math.sqrt(self.args.t / f) + self.args.t / f
+
+    def _init_ngrams(self):
+        for i, e in enumerate(self.entries):
+            e.subwords = [i]
+            if e.word != "</s>":
+                e.subwords.extend(self._compute_subwords("<" + e.word + ">"))
+
+    def _compute_subwords(self, word: str) -> list[int]:
+        minn, maxn = self.args.minn, self.args.maxn
+        if maxn <= 0:
+            return []
+        raw = word.encode("utf-8")
+        starts = [i for i in range(len(raw)) if i == 0 or (raw[i] & 0xC0) != 0x80]
+        starts.append(len(raw))
+        ngrams: list[int] = []
+        for ci in range(len(starts) - 1):
+            for n in range(1, maxn + 1):
+                end = ci + n
+                if end >= len(starts):
+                    break
+                if n >= minn and not (n == 1 and (ci == 0 or end == len(starts) - 1)):
+                    sub = raw[starts[ci]:starts[end]].decode("utf-8", "replace")
+                    h = _fnv(sub) % self.args.bucket
+                    self._push_hash(ngrams, h)
+        return ngrams
+
+    def _push_hash(self, out: list[int], h: int):
+        if self._pruneidx_size == 0 or h < 0:
+            return
+        if self._pruneidx_size > 0:
+            if h in self._pruneidx:
+                h = self._pruneidx[h]
             else:
-                self.nlabels_ += 1
+                return
+        out.append(self.nwords + self.nlabels + h)
 
-    def get_counts(self, entry_type):
-        return [w['count'] for w in self.words if w['type'] == entry_type]
+    # -- subwords / word n-grams ---------------------------------------------
 
-    # -- getLine variants --
-    def get_line_sent2vec(self, tokens, rng, flags=0):
-        """Parse a sentence for sent2vec training.
+    def get_subwords(self, word: str) -> list[int]:
+        wid = self.get_id(word)
+        if wid >= 0:
+            return list(self.entries[wid].subwords)
+        if word != "</s>":
+            return self._compute_subwords("<" + word + ">")
+        return []
 
-        Returns (word_ids, word_hashes, labels).
-        """
-        words = []
-        word_hashes = []
-        labels = []
-        ntokens = 0
-        for token in tokens:
-            if flags & SKIP_EOS:
-                if token == EOS:
+    def add_word_ngrams(self, line: list[int], hashes: list[int], n: int):
+        for i in range(len(hashes)):
+            h = hashes[i] & 0xFFFFFFFFFFFFFFFF
+            for j in range(i + 1, min(len(hashes), i + n)):
+                h = ((h * 116049371) + hashes[j]) & 0xFFFFFFFFFFFFFFFF
+                self._push_hash(line, h % self.args.bucket)
+
+    def add_word_ngrams_dropout(self, line: list[int], hashes: list[int],
+                                n: int, k: int, rng: np.random.RandomState):
+        sz = len(hashes)
+        if sz <= 2:
+            return
+        drop = [False] * sz
+        nd = 0
+        while nd < k and sz - nd > 2:
+            t = rng.randint(1, sz - 1)
+            if not drop[t]:
+                drop[t] = True
+                nd += 1
+        for i in range(sz):
+            if drop[i]:
+                continue
+            h = hashes[i] & 0xFFFFFFFFFFFFFFFF
+            for j in range(i + 1, min(sz, i + n)):
+                if drop[j]:
                     break
-            h = self.hash(token)
-            wid = self.get_id(token, h)
-            if flags & SKIP_OOV:
-                if wid < 0:
-                    continue
-            etype = self.get_type(token) if wid < 0 else self.get_type(wid)
-            ntokens += 1
-            if etype == ENTRY_WORD:
-                if flags & SKIP_FRQ:
-                    if self.discard(wid, rng.random()):
-                        continue
-                words.append(wid)
-                word_hashes.append(h)
-            elif etype == ENTRY_LABEL and wid >= 0:
-                labels.append(wid)
-            if flags & SKIP_LNG:
-                if ntokens > MAX_LINE_SIZE:
-                    break
-            if token == EOS:
+                h = ((h * 116049371) + hashes[j]) & 0xFFFFFFFFFFFFFFFF
+                self._push_hash(line, h % self.args.bucket)
+
+    # -- training line parser ------------------------------------------------
+
+    def get_line(self, tokens: list[str], rng: np.random.RandomState,
+                 *, skip_oov=False, skip_freq=False
+                 ) -> tuple[list[int], list[int], int]:
+        """Parse tokens into (word_ids, word_hashes, ntokens)."""
+        ids: list[int] = []
+        hashes: list[int] = []
+        nt = 0
+        for tok in tokens:
+            if tok == "</s>":
                 break
-        return words, word_hashes, labels, ntokens
+            h = _fnv(tok)
+            wid = self.get_id(tok, h)
+            if skip_oov and wid < 0:
+                continue
+            etype = self.entries[wid].type if wid >= 0 else (
+                _LABEL if tok.startswith(self.args.label_prefix) else _WORD)
+            nt += 1
+            if etype == _WORD:
+                if skip_freq and rng.random() > self.pdiscard[wid]:
+                    continue
+                ids.append(wid)
+                hashes.append(h)
+            if nt > _MAX_LINE:
+                break
+        return ids, hashes, nt
 
-    # -- binary I/O --
+    # -- binary I/O ----------------------------------------------------------
+
     def save(self, f):
-        f.write(struct.pack('<i', self.size))
-        f.write(struct.pack('<i', self.nwords_))
-        f.write(struct.pack('<i', self.nlabels_))
-        f.write(struct.pack('<q', self.ntokens_))
-        f.write(struct.pack('<q', self.pruneidx_size))
-        for i in range(self.size):
-            e = self.words[i]
-            f.write(e['word'].encode('utf-8'))
-            f.write(b'\x00')
-            f.write(struct.pack('<q', e['count']))
-            f.write(struct.pack('<b', e['type']))
-        for first, second in self.pruneidx.items():
-            f.write(struct.pack('<i', first))
-            f.write(struct.pack('<i', second))
+        n = len(self.entries)
+        # C++ layout: int32, int32, int32, int64, int64 = 28 bytes
+        f.write(struct.pack("<i", n))
+        f.write(struct.pack("<i", self.nwords))
+        f.write(struct.pack("<i", self.nlabels))
+        f.write(struct.pack("<q", self.ntokens))
+        f.write(struct.pack("<q", self._pruneidx_size))
+        for e in self.entries:
+            f.write(e.word.encode("utf-8") + b"\x00")
+            f.write(struct.pack("<qb", e.count, e.type))
+        for k, v in self._pruneidx.items():
+            f.write(struct.pack("<ii", k, v))
 
     def load(self, f):
-        self.words = []
-        self.size = struct.unpack('<i', f.read(4))[0]
-        self.nwords_ = struct.unpack('<i', f.read(4))[0]
-        self.nlabels_ = struct.unpack('<i', f.read(4))[0]
-        self.ntokens_ = struct.unpack('<q', f.read(8))[0]
-        self.pruneidx_size = struct.unpack('<q', f.read(8))[0]
-        for _ in range(self.size):
-            word_bytes = bytearray()
-            while True:
-                c = f.read(1)
-                if c == b'\x00' or c == b'':
-                    break
-                word_bytes.extend(c)
-            word = word_bytes.decode('utf-8', errors='replace')
-            count = struct.unpack('<q', f.read(8))[0]
-            etype = struct.unpack('<b', f.read(1))[0]
-            self.words.append({
-                'word': word,
-                'count': count,
-                'type': etype,
-                'subwords': [],
-            })
-        self.pruneidx = {}
-        for _ in range(max(0, self.pruneidx_size)):
-            first = struct.unpack('<i', f.read(4))[0]
-            second = struct.unpack('<i', f.read(4))[0]
-            self.pruneidx[first] = second
-        self.init_table_discard()
-        self.init_ngrams()
-        word2intsize = max(1, math.ceil(self.size / 0.7))
-        self.word2int = np.full(word2intsize, -1, dtype=np.int32)
-        for i in range(self.size):
-            self.word2int[self.find(self.words[i]['word'])] = i
+        # C++ layout: int32, int32, int32, int64, int64 = 28 bytes
+        n = struct.unpack("<i", f.read(4))[0]
+        self.nwords = struct.unpack("<i", f.read(4))[0]
+        self.nlabels = struct.unpack("<i", f.read(4))[0]
+        self.ntokens = struct.unpack("<q", f.read(8))[0]
+        self._pruneidx_size = struct.unpack("<q", f.read(8))[0]
+        self.entries = []
+        for _ in range(n):
+            wb = bytearray()
+            while (c := f.read(1)) != b"\x00" and c:
+                wb.extend(c)
+            count, etype = struct.unpack("<qb", f.read(9))
+            self.entries.append(Entry(wb.decode("utf-8", "replace"), count, etype))
+        self._pruneidx = {}
+        for _ in range(max(0, self._pruneidx_size)):
+            k, v = struct.unpack("<ii", f.read(8))
+            self._pruneidx[k] = v
+        self._init_discard()
+        self._init_ngrams()
+        sz = max(1, math.ceil(n / 0.7))
+        self._w2i = np.full(sz, -1, dtype=np.int32)
+        for i, e in enumerate(self.entries):
+            self._w2i[self._slot(e.word)] = i
+
+    def word_counts(self) -> list[int]:
+        return [e.count for e in self.entries if e.type == _WORD]
 
 
 # ---------------------------------------------------------------------------
-# Negative sampling table builder
-# ---------------------------------------------------------------------------
-
-def build_negative_table(target_counts):
-    """Build the unigram^0.5 negative sampling table."""
-    z = sum(c ** 0.5 for c in target_counts)
-    negatives = []
-    for i, c in enumerate(target_counts):
-        n_entries = int(c ** 0.5 * NEGATIVE_TABLE_SIZE / z)
-        negatives.extend([i] * n_entries)
-    if len(negatives) == 0:
-        negatives.append(0)
-    return np.array(negatives, dtype=np.int32)
-
-
-# ---------------------------------------------------------------------------
-# Sent2Vec model
+# Sent2Vec
 # ---------------------------------------------------------------------------
 
 class Sent2Vec:
-    """Pure Python sent2vec implementation."""
+    """Pure Python sent2vec model.
 
-    def __init__(self):
-        self.args = None
-        self.dict = None
-        self.wi = None        # input embeddings  (flat float32 array)
-        self.wo = None        # output embeddings (flat float32 array)
-        self.quant = False
-        self.version = FASTTEXT_VERSION
-        self._sigmoid_table = _build_sigmoid_table()
-        self._log_table = _build_log_table()
+    Two ways to create::
+
+        model = Sent2Vec.train("corpus.txt", dim=100)
+        model = Sent2Vec.load("model.bin")
+
+    Then embed::
+
+        vec = model.embed("a sentence")
+        mat = model.embed(["sent one", "sent two"])  # (n, dim) array
+    """
+
+    def __init__(self, args: Args, dictionary: Dictionary,
+                 wi: np.ndarray, wo: np.ndarray):
+        self.args = args
+        self.dictionary = dictionary
+        self.wi = wi  # (n_input, dim)  float32
+        self.wo = wo  # (n_output, dim) float32
+
+    @property
+    def dim(self) -> int:
+        return self.args.dim
+
+    # -----------------------------------------------------------------------
+    # Embedding
+    # -----------------------------------------------------------------------
+
+    def word_vector(self, word: str) -> np.ndarray:
+        """Return the embedding for a single word."""
+        ngrams = self.dictionary.get_subwords(word)
+        if not ngrams:
+            return np.zeros(self.dim, dtype=np.float32)
+        return self.wi[ngrams].mean(axis=0)
+
+    def embed(self, sentences: str | list[str]) -> np.ndarray:
+        """Compute sent2vec embeddings.
+
+        Args:
+            sentences: A single sentence string, or a list of sentences.
+
+        Returns:
+            A 1-D array (dim,) for a single sentence, or a 2-D array
+            (n, dim) for a list.
+        """
+        if isinstance(sentences, str):
+            return self._embed_one(sentences)
+        out = np.zeros((len(sentences), self.dim), dtype=np.float32)
+        for i, s in enumerate(sentences):
+            out[i] = self._embed_one(s)
+        return out
+
+    def _embed_one(self, sentence: str) -> np.ndarray:
+        svec = np.zeros(self.dim, dtype=np.float32)
+        count = 0
+        for word in sentence.split():
+            wv = self.word_vector(word)
+            norm = np.linalg.norm(wv)
+            if norm > 0:
+                svec += wv / norm
+                count += 1
+        if count > 0:
+            svec /= count
+        return svec
+
+    # keep old name as alias
+    get_sentence_vector = _embed_one
+
+    # -----------------------------------------------------------------------
+    # I/O  (binary-compatible with C++ fasttext)
+    # -----------------------------------------------------------------------
+
+    def save(self, path: str):
+        """Save model in the C++ fasttext binary format."""
+        with open(path, "wb") as f:
+            f.write(struct.pack("<ii", _MAGIC, _VERSION))
+            f.write(self.args.to_bytes())
+            self.dictionary.save(f)
+            f.write(struct.pack("<?", False))   # quant_input
+            f.write(struct.pack("<qq", *self.wi.shape))
+            self.wi.tofile(f)
+            f.write(struct.pack("<?", False))   # qout
+            f.write(struct.pack("<qq", *self.wo.shape))
+            self.wo.tofile(f)
+
+    @classmethod
+    def load(cls, path: str) -> "Sent2Vec":
+        """Load a model from the C++ fasttext binary format."""
+        with open(path, "rb") as f:
+            magic, version = struct.unpack("<ii", f.read(8))
+            if magic != _MAGIC:
+                raise ValueError("Bad magic number -- not a fasttext model")
+            if version > _VERSION:
+                raise ValueError(f"Model version {version} not supported")
+
+            args = Args.from_bytes(f.read(Args.BIN_SIZE))
+            d = Dictionary(args)
+            d.load(f)
+
+            if struct.unpack("<?", f.read(1))[0]:
+                raise ValueError("Quantised input not supported")
+            m, n = struct.unpack("<qq", f.read(16))
+            wi = np.frombuffer(f.read(m * n * 4), np.float32).reshape(m, n).copy()
+
+            if struct.unpack("<?", f.read(1))[0]:
+                raise ValueError("Quantised output not supported")
+            m, n = struct.unpack("<qq", f.read(16))
+            wo = np.frombuffer(f.read(m * n * 4), np.float32).reshape(m, n).copy()
+
+        return cls(args, d, wi, wo)
+
+    # keep old name as alias
+    load_model = classmethod(lambda cls, p: cls.load(p))
+    save_model = save
+
+    def save_vectors(self, path: str):
+        """Save word vectors in word2vec text format."""
+        nw = self.dictionary.nwords
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{nw} {self.dim}\n")
+            for i in range(nw):
+                w = self.dictionary.entries[i].word
+                v = self.word_vector(w)
+                f.write(f"{w} {' '.join(f'{x:.5f}' for x in v)}\n")
 
     # -----------------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------------
 
-    def train(self, input_path, output_path, **kwargs):
-        """Train a sent2vec model.
+    @classmethod
+    def train(cls, input_path: str, *, output_path: str | None = None,
+              **kwargs) -> "Sent2Vec":
+        """Train a new sent2vec model.
 
         Args:
-            input_path: Path to training corpus (one sentence per line).
-            output_path: Base path for saving model files.
-            **kwargs: Hyperparameters (dim, epoch, lr, neg, minCount,
-                      wordNgrams, dropoutK, bucket, t, minn, maxn,
-                      thread, verbose, seed, minCountLabel).
+            input_path: Training corpus (one sentence per line).
+            output_path: If given, save .bin and .vec after training.
+            **kwargs: Any ``Args`` field (dim, epoch, lr, neg, min_count,
+                      word_ngrams, dropout_k, bucket, t, seed, verbose, ...).
+
+        Returns:
+            Trained ``Sent2Vec`` model.
         """
-        self.args = {
-            'model': MODEL_SENT2VEC,
-            'loss': LOSS_NS,
-            'dim': 100,
-            'epoch': 5,
-            'lr': 0.2,
-            'neg': 10,
-            'minCount': 5,
-            'minCountLabel': 0,
-            'wordNgrams': 1,
-            'dropoutK': 2,
-            'bucket': 2000000,
-            'minn': 0,
-            'maxn': 0,
-            'ws': 5,
-            't': 1e-4,
-            'lrUpdateRate': 100,
-            'label': '__label__',
-            'verbose': 2,
-            'seed': 0,
-            'thread': 1,   # Python uses a single thread
-            'input': input_path,
-            'output': output_path,
-        }
-        self.args.update(kwargs)
+        a = Args(**{k: v for k, v in kwargs.items() if hasattr(Args, k)})
+        a.model = _SENT2VEC
+        a.loss = _NS
+        if a.word_ngrams <= 1 and a.maxn == 0:
+            a.bucket = 0
 
-        # Force model type
-        self.args['model'] = MODEL_SENT2VEC
-        self.args['loss'] = LOSS_NS
+        d = Dictionary(a)
+        d.read_from_file(input_path)
 
-        # If wordNgrams <= 1 and maxn == 0, no bucket needed
-        if self.args['wordNgrams'] <= 1 and self.args['maxn'] == 0:
-            self.args['bucket'] = 0
+        n_in = d.nwords + d.nlabels + a.bucket
+        n_out = d.nwords + d.nlabels
+        bound = 1.0 / a.dim
+        rng_init = np.random.RandomState(a.seed)
+        wi = rng_init.uniform(-bound, bound, (n_in, a.dim)).astype(np.float32)
+        wo = np.zeros((n_out, a.dim), dtype=np.float32)
 
-        # Build dictionary
-        self.dict = Dictionary(self.args)
-        self.dict.read_from_file(input_path)
+        negatives = _build_neg_table(d.word_counts())
 
-        dim = self.args['dim']
-        n_input = self.dict.nwords() + self.dict.nlabels() + self.args['bucket']
-        n_output = self.dict.nwords() + self.dict.nlabels()
+        model = cls(a, d, wi, wo)
+        model._run_training(input_path, negatives)
 
-        # Initialize matrices
-        bound = 1.0 / dim
-        rng_init = np.random.RandomState(self.args['seed'])
-        self.wi = rng_init.uniform(-bound, bound, n_input * dim).astype(np.float32)
-        self.wo = np.zeros(n_output * dim, dtype=np.float32)
+        if output_path:
+            model.save(output_path + ".bin")
+            model.save_vectors(output_path + ".vec")
+        return model
 
-        # Build negative sampling table
-        target_counts = self.dict.get_counts(ENTRY_WORD)
-        negatives = build_negative_table(target_counts)
+    def _run_training(self, input_path: str, negatives: np.ndarray):
+        a = self.args
+        d = self.dictionary
+        dim = a.dim
+        total = a.epoch * d.ntokens
+        rng = np.random.RandomState(a.seed)
+        rng_state = np.int64(a.seed + 1)
 
-        # Training loop
-        self._train_loop(negatives)
-
-        # Save
-        self.save_model(output_path + '.bin')
-        self.save_vectors(output_path + '.vec')
-
-    def _train_loop(self, negatives):
-        """Main training loop (single-threaded)."""
-        args = self.args
-        dim = args['dim']
-        ntokens = self.dict.ntokens()
-        total_tokens = args['epoch'] * ntokens
-        neg = args['neg']
-        neg_size = len(negatives)
-        normalize_gradient = True  # sent2vec uses normalizeGradient
-
-        # State
-        hidden = np.zeros(dim, dtype=np.float32)
-        grad = np.zeros(dim, dtype=np.float32)
-        rng = np.random.RandomState(args['seed'])
-        rng_state = np.int64(args['seed'] + 1)  # for numba LCG
-
-        token_count = 0
-        loss_sum = 0.0
-        n_examples = 0
-        start_time = time.time()
-
-        # Read corpus into sentences
         sentences = []
-        with open(args['input'], 'r', encoding='utf-8', errors='replace') as f:
-            for raw_line in f:
-                tokens = raw_line.strip().split()
-                if tokens:
-                    sentences.append(tokens)
-
+        with open(input_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                toks = raw.split()
+                if toks:
+                    sentences.append(toks)
         if not sentences:
-            raise ValueError("No sentences found in input file")
+            raise ValueError("No sentences in input file")
 
-        n_sentences = len(sentences)
+        tok_count = 0
+        loss_sum = 0.0
+        n_ex = 0
+        t0 = time.time()
 
-        for epoch in range(args['epoch']):
-            for si in range(n_sentences):
-                tokens = sentences[si]
-                # Parse the sentence
-                line, hashes, labels, nt = self.dict.get_line_sent2vec(
-                    tokens, rng,
-                    flags=SKIP_EOS | SKIP_LNG | SKIP_OOV)
-                token_count += nt
-
-                if len(line) <= 1:
+        for epoch in range(a.epoch):
+            for si, toks in enumerate(sentences):
+                ids, hashes, nt = d.get_line(toks, rng, skip_oov=True)
+                tok_count += nt
+                if len(ids) <= 1:
                     continue
 
-                # Progress and learning rate
-                progress = float(token_count) / float(total_tokens)
-                lr = args['lr'] * (1.0 - progress)
+                progress = tok_count / total
+                lr = a.lr * (1.0 - progress)
                 if lr <= 0:
                     break
 
-                # sent2vec training step
-                loss_val, rng_state = self._sent2vec_step(
-                    line, hashes, lr, neg, negatives, neg_size,
-                    hidden, grad, dim, rng, rng_state, normalize_gradient)
-                loss_sum += loss_val[0]
-                n_examples += loss_val[1]
+                ls, n, rng_state = self._sent2vec_step(
+                    ids, hashes, lr, negatives, rng, rng_state)
+                loss_sum += ls
+                n_ex += n
 
-                # Print progress
-                if args.get('verbose', 2) > 1 and si % 1000 == 0:
-                    elapsed = time.time() - start_time
-                    wps = token_count / max(elapsed, 1e-6)
-                    avg_loss = loss_sum / max(n_examples, 1)
+                if a.verbose > 1 and si % 1000 == 0:
+                    elapsed = time.time() - t0
                     sys.stderr.write(
-                        f"\rProgress: {progress * 100:.1f}%"
-                        f"  words/sec: {wps:.0f}"
+                        f"\rProgress: {progress*100:.1f}%"
+                        f"  words/sec: {tok_count/max(elapsed,1e-6):.0f}"
                         f"  lr: {lr:.6f}"
-                        f"  avg.loss: {avg_loss:.6f}")
+                        f"  avg.loss: {loss_sum/max(n_ex,1):.6f}")
                     sys.stderr.flush()
+            else:
+                continue
+            break  # lr <= 0
 
-            if lr <= 0:
-                break
-
-        if args.get('verbose', 2) > 0:
-            avg_loss = loss_sum / max(n_examples, 1)
+        if a.verbose > 0:
             sys.stderr.write(
-                f"\rProgress: 100.0%  avg.loss: {avg_loss:.6f}\n")
+                f"\rProgress: 100.0%  avg.loss: {loss_sum/max(n_ex,1):.6f}\n")
             sys.stderr.flush()
 
-    def _sent2vec_step(self, line, hashes, lr, neg, negatives, neg_size,
-                       hidden, grad, dim, rng, rng_state, normalize_gradient):
-        """One sent2vec training step over a sentence.
-
-        For each word in the sentence, create a context (sentence minus
-        that word), compute word n-grams with optional dropout, then do
-        a negative-sampling update.
-        """
+    def _sent2vec_step(self, ids, hashes, lr, negatives, rng, rng_state):
+        d = self.dictionary
+        a = self.args
         total_loss = 0.0
-        total_examples = 0
+        total_n = 0
 
-        for w in range(len(line)):
-            # Discard decision
-            wid = line[w]
-            if self.dict.discard(wid, rng.random()):
+        for w in range(len(ids)):
+            wid = ids[w]
+            if rng.random() > d.pdiscard[wid]:
                 continue
-            if self.dict.get_token_count(wid) < self.args.get('minCountLabel', 0):
+            if d.entries[wid].count < a.min_count_label:
                 continue
 
-            # Build context: replace target word with PLACEHOLDER (index 0)
-            bow = list(line)
+            bow = list(ids)
             boh = list(hashes)
             bow[w] = 0
             boh[w] = 0
 
-            # Add word n-grams
-            if self.args['dropoutK'] > 0:
-                self.dict.add_word_ngrams_dropout(
-                    bow, boh, self.args['wordNgrams'],
-                    self.args['dropoutK'], rng)
+            if a.dropout_k > 0:
+                d.add_word_ngrams_dropout(bow, boh, a.word_ngrams, a.dropout_k, rng)
             else:
-                self.dict.add_word_ngrams(bow, boh, self.args['wordNgrams'])
+                d.add_word_ngrams(bow, boh, a.word_ngrams)
 
-            # Convert to numpy for numba
-            input_ids = np.array(bow, dtype=np.int32)
-            target = np.int32(line[w])
-
-            loss, rng_state = _negative_sampling_forward(
-                self.wo, self.wi, hidden, grad, input_ids,
-                target, neg, negatives, neg_size,
-                dim, np.float32(lr),
-                self._sigmoid_table, self._log_table,
-                normalize_gradient, rng_state)
-
+            ctx = np.array(bow, dtype=np.int32)
+            loss, rng_state = _ns_update(
+                self.wi, self.wo, ctx, np.int32(ids[w]),
+                a.neg, negatives, a.dim, np.float32(lr), True, rng_state)
             total_loss += float(loss)
-            total_examples += 1
+            total_n += 1
 
-        return (total_loss, total_examples), rng_state
-
-    # -----------------------------------------------------------------------
-    # Inference
-    # -----------------------------------------------------------------------
-
-    def get_word_vector(self, word):
-        """Get the embedding for a single word."""
-        dim = self.args['dim']
-        ngrams = self.dict.get_subwords(word)
-        vec = np.zeros(dim, dtype=np.float32)
-        for idx in ngrams:
-            _add_row_to_vec(self.wi, vec, idx, dim)
-        if len(ngrams) > 0:
-            vec *= 1.0 / len(ngrams)
-        return vec
-
-    def get_sentence_vector(self, sentence):
-        """Compute the sent2vec embedding for a sentence string.
-
-        Each word vector is L2-normalised before averaging.
-        """
-        dim = self.args['dim']
-        svec = np.zeros(dim, dtype=np.float32)
-        words = sentence.strip().split()
-        count = 0
-        for word in words:
-            vec = self.get_word_vector(word)
-            norm = np.sqrt(np.sum(vec * vec))
-            if norm > 0:
-                vec *= 1.0 / norm
-                svec += vec
-                count += 1
-        if count > 0:
-            svec *= 1.0 / count
-        return svec
-
-    def get_sentence_vectors(self, sentences):
-        """Batch compute sentence embeddings.
-
-        Args:
-            sentences: list of sentence strings.
-
-        Returns:
-            numpy array of shape (len(sentences), dim).
-        """
-        dim = self.args['dim']
-        result = np.zeros((len(sentences), dim), dtype=np.float32)
-        for i, sent in enumerate(sentences):
-            result[i] = self.get_sentence_vector(sent)
-        return result
-
-    # -----------------------------------------------------------------------
-    # Model I/O  (compatible with C++ binary format)
-    # -----------------------------------------------------------------------
-
-    def save_model(self, filepath):
-        """Save model in the C++ fasttext binary format."""
-        with open(filepath, 'wb') as f:
-            # Magic + version
-            f.write(struct.pack('<i', FASTTEXT_FILEFORMAT_MAGIC_INT32))
-            f.write(struct.pack('<i', FASTTEXT_VERSION))
-            # Args
-            self._save_args(f)
-            # Dictionary
-            self.dict.save(f)
-            # quant flag for input
-            f.write(struct.pack('<?', False))
-            # Input matrix
-            n_input = len(self.wi) // self.args['dim']
-            dim = self.args['dim']
-            f.write(struct.pack('<q', n_input))
-            f.write(struct.pack('<q', dim))
-            f.write(self.wi.tobytes())
-            # qout flag
-            f.write(struct.pack('<?', False))
-            # Output matrix
-            n_output = len(self.wo) // dim
-            f.write(struct.pack('<q', n_output))
-            f.write(struct.pack('<q', dim))
-            f.write(self.wo.tobytes())
-
-    def load_model(self, filepath):
-        """Load a model from the C++ fasttext binary format."""
-        with open(filepath, 'rb') as f:
-            magic = struct.unpack('<i', f.read(4))[0]
-            if magic != FASTTEXT_FILEFORMAT_MAGIC_INT32:
-                raise ValueError("Invalid model file format (bad magic number)")
-            self.version = struct.unpack('<i', f.read(4))[0]
-            if self.version > FASTTEXT_VERSION:
-                raise ValueError(f"Model version {self.version} > supported {FASTTEXT_VERSION}")
-
-            # Load args
-            self.args = self._load_args(f)
-
-            # Load dictionary
-            self.dict = Dictionary(self.args)
-            self.dict.load(f)
-
-            # Input matrix
-            quant_input = struct.unpack('<?', f.read(1))[0]
-            if quant_input:
-                raise ValueError("Quantised models are not supported in the pure Python version")
-            m_in = struct.unpack('<q', f.read(8))[0]
-            n_in = struct.unpack('<q', f.read(8))[0]
-            self.wi = np.frombuffer(f.read(m_in * n_in * 4), dtype=np.float32).copy()
-
-            # Output matrix
-            qout = struct.unpack('<?', f.read(1))[0]
-            if qout:
-                raise ValueError("Quantised output not supported in the pure Python version")
-            m_out = struct.unpack('<q', f.read(8))[0]
-            n_out = struct.unpack('<q', f.read(8))[0]
-            self.wo = np.frombuffer(f.read(m_out * n_out * 4), dtype=np.float32).copy()
-
-    def save_vectors(self, filepath):
-        """Save word vectors in text format (word2vec style)."""
-        dim = self.args['dim']
-        nwords = self.dict.nwords()
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(f"{nwords} {dim}\n")
-            for i in range(nwords):
-                word = self.dict.get_word(i)
-                vec = self.get_word_vector(word)
-                vec_str = ' '.join(f'{v:.5f}' for v in vec)
-                f.write(f"{word} {vec_str}\n")
-
-    def _save_args(self, f):
-        """Write args to binary stream in C++ format."""
-        a = self.args
-        f.write(struct.pack('<i', a['dim']))
-        f.write(struct.pack('<i', a['ws']))
-        f.write(struct.pack('<i', a['epoch']))
-        f.write(struct.pack('<i', a['minCount']))
-        f.write(struct.pack('<i', a['neg']))
-        f.write(struct.pack('<i', a['wordNgrams']))
-        f.write(struct.pack('<i', a['loss']))
-        f.write(struct.pack('<i', a['model']))
-        f.write(struct.pack('<i', a['bucket']))
-        f.write(struct.pack('<i', a['minn']))
-        f.write(struct.pack('<i', a['maxn']))
-        f.write(struct.pack('<i', a['lrUpdateRate']))
-        f.write(struct.pack('<d', a['t']))
-
-    def _load_args(self, f):
-        """Read args from binary stream in C++ format."""
-        a = {}
-        a['dim'] = struct.unpack('<i', f.read(4))[0]
-        a['ws'] = struct.unpack('<i', f.read(4))[0]
-        a['epoch'] = struct.unpack('<i', f.read(4))[0]
-        a['minCount'] = struct.unpack('<i', f.read(4))[0]
-        a['neg'] = struct.unpack('<i', f.read(4))[0]
-        a['wordNgrams'] = struct.unpack('<i', f.read(4))[0]
-        a['loss'] = struct.unpack('<i', f.read(4))[0]
-        a['model'] = struct.unpack('<i', f.read(4))[0]
-        a['bucket'] = struct.unpack('<i', f.read(4))[0]
-        a['minn'] = struct.unpack('<i', f.read(4))[0]
-        a['maxn'] = struct.unpack('<i', f.read(4))[0]
-        a['lrUpdateRate'] = struct.unpack('<i', f.read(4))[0]
-        a['t'] = struct.unpack('<d', f.read(8))[0]
-        # Fill in defaults for fields not in the binary format
-        a['label'] = '__label__'
-        a['verbose'] = 2
-        a['lr'] = 0.2
-        a['dropoutK'] = 2
-        a['minCountLabel'] = 0
-        a['seed'] = 0
-        a['thread'] = 1
-        return a
-
-    # -----------------------------------------------------------------------
-    # Dimension accessor
-    # -----------------------------------------------------------------------
-
-    @property
-    def dim(self):
-        return self.args['dim'] if self.args else 0
+        return total_loss, total_n, rng_state
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _print_usage():
-    sys.stderr.write(
-        "usage: python sent2vec.py <command> [<args>]\n\n"
-        "  sent2vec     Train a sent2vec model\n"
-        "  print-vec    Print sentence vectors from a trained model\n\n"
-        "Training arguments:\n"
-        "  -input        training file path (required)\n"
-        "  -output       output file path (required)\n"
-        "  -dim          size of word vectors [100]\n"
-        "  -epoch        number of epochs [5]\n"
-        "  -lr           learning rate [0.2]\n"
-        "  -neg          number of negatives sampled [10]\n"
-        "  -minCount     minimal number of word occurrences [5]\n"
-        "  -wordNgrams   max length of word ngram [1]\n"
-        "  -dropoutK     number of ngrams dropped when forming n-gram features [2]\n"
-        "  -bucket       number of buckets [2000000]\n"
-        "  -t            sampling threshold [1e-4]\n"
-        "  -verbose      verbosity level [2]\n"
-        "  -seed         random seed [0]\n"
-    )
+def _build_neg_table(counts: list[int]) -> np.ndarray:
+    z = sum(c ** 0.5 for c in counts)
+    table: list[int] = []
+    for i, c in enumerate(counts):
+        table.extend([i] * int(c ** 0.5 * _NEG_TABLE / z))
+    if not table:
+        table.append(0)
+    return np.array(table, dtype=np.int32)
 
 
-def main():
-    if len(sys.argv) < 2:
-        _print_usage()
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cli():
+    top = argparse.ArgumentParser(prog="sent2vec",
+                                  description="sent2vec (pure Python)")
+    sub = top.add_subparsers(dest="command")
+
+    # -- train ---------------------------------------------------------------
+    tr = sub.add_parser("train", help="Train a sent2vec model")
+    tr.add_argument("-input", required=True, dest="input_path")
+    tr.add_argument("-output", required=True, dest="output_path")
+    tr.add_argument("-dim", type=int, default=100)
+    tr.add_argument("-epoch", type=int, default=5)
+    tr.add_argument("-lr", type=float, default=0.2)
+    tr.add_argument("-neg", type=int, default=10)
+    tr.add_argument("-minCount", type=int, default=5, dest="min_count")
+    tr.add_argument("-wordNgrams", type=int, default=1, dest="word_ngrams")
+    tr.add_argument("-dropoutK", type=int, default=2, dest="dropout_k")
+    tr.add_argument("-bucket", type=int, default=2_000_000)
+    tr.add_argument("-t", type=float, default=1e-4)
+    tr.add_argument("-minn", type=int, default=0)
+    tr.add_argument("-maxn", type=int, default=0)
+    tr.add_argument("-verbose", type=int, default=2)
+    tr.add_argument("-seed", type=int, default=0)
+
+    # -- embed ---------------------------------------------------------------
+    em = sub.add_parser("embed", aliases=["print-vec"],
+                        help="Print sentence vectors")
+    em.add_argument("model_path")
+
+    parsed = top.parse_args()
+    if parsed.command is None:
+        top.print_help()
         sys.exit(1)
 
-    command = sys.argv[1]
+    if parsed.command == "train":
+        kw = {k: v for k, v in vars(parsed).items()
+              if k not in ("command", "input_path", "output_path")}
+        Sent2Vec.train(parsed.input_path, output_path=parsed.output_path, **kw)
 
-    if command == 'sent2vec':
-        # Parse args
-        kwargs = {}
-        i = 2
-        input_path = None
-        output_path = None
-        while i < len(sys.argv):
-            arg = sys.argv[i]
-            if arg == '-input':
-                input_path = sys.argv[i + 1]; i += 2
-            elif arg == '-output':
-                output_path = sys.argv[i + 1]; i += 2
-            elif arg == '-dim':
-                kwargs['dim'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-epoch':
-                kwargs['epoch'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-lr':
-                kwargs['lr'] = float(sys.argv[i + 1]); i += 2
-            elif arg == '-neg':
-                kwargs['neg'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-minCount':
-                kwargs['minCount'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-wordNgrams':
-                kwargs['wordNgrams'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-dropoutK':
-                kwargs['dropoutK'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-bucket':
-                kwargs['bucket'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-t':
-                kwargs['t'] = float(sys.argv[i + 1]); i += 2
-            elif arg == '-verbose':
-                kwargs['verbose'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-seed':
-                kwargs['seed'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-minn':
-                kwargs['minn'] = int(sys.argv[i + 1]); i += 2
-            elif arg == '-maxn':
-                kwargs['maxn'] = int(sys.argv[i + 1]); i += 2
-            else:
-                sys.stderr.write(f"Unknown argument: {arg}\n")
-                _print_usage()
-                sys.exit(1)
-
-        if not input_path or not output_path:
-            sys.stderr.write("Error: -input and -output are required.\n")
-            _print_usage()
-            sys.exit(1)
-
-        model = Sent2Vec()
-        model.train(input_path, output_path, **kwargs)
-
-    elif command == 'print-vec':
-        if len(sys.argv) < 3:
-            sys.stderr.write("usage: python sent2vec.py print-vec <model.bin>\n")
-            sys.exit(1)
-        model_path = sys.argv[2]
-        model = Sent2Vec()
-        model.load_model(model_path)
-        dim = model.dim
-        sys.stderr.write(f"Loaded model: {model.dict.nwords()} words, dim={dim}\n")
-        sys.stderr.write("Enter sentences (one per line, Ctrl-D to stop):\n")
+    elif parsed.command in ("embed", "print-vec"):
+        model = Sent2Vec.load(parsed.model_path)
+        sys.stderr.write(
+            f"Loaded: {model.dictionary.nwords} words, dim={model.dim}\n"
+            f"Enter sentences (one per line, Ctrl-D to stop):\n")
         for line in sys.stdin:
-            vec = model.get_sentence_vector(line)
-            print(' '.join(f'{v:.5f}' for v in vec))
-    else:
-        sys.stderr.write(f"Unknown command: {command}\n")
-        _print_usage()
-        sys.exit(1)
+            vec = model.embed(line.strip())
+            print(" ".join(f"{v:.5f}" for v in vec))
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    _cli()

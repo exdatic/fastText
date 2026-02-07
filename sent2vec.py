@@ -473,14 +473,10 @@ def _build_neg_table(counts: np.ndarray) -> np.ndarray:
     """Build negative-sampling table, sized proportionally to vocab."""
     sqrt_c = np.sqrt(counts.astype(np.float64))
     prob = sqrt_c / sqrt_c.sum()
-    # scale table to vocab: at least 1000 slots per word, capped at 10M
+    cum = np.cumsum(prob)
     size = int(min(max(len(counts) * 1000, 100_000), 10_000_000))
-    slots = np.maximum((prob * size).astype(np.int64), 1)
-    diff = size - slots.sum()
-    if diff != 0:
-        slots[np.argmax(prob)] += diff
-    table = np.repeat(np.arange(len(counts), dtype=np.int32) + 1, slots.astype(np.intp))
-    return table[:size]
+    table = np.searchsorted(cum, np.linspace(0, 1, size, endpoint=False))
+    return np.clip(table, 0, len(counts) - 1).astype(np.int32) + 1  # +1 skip placeholder
 
 def _progress(tok, total, t0, lr, loss, n):
     pct = tok / total * 100

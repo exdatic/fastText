@@ -38,18 +38,22 @@ _SIG, _LOG = _make_tables()
 
 # ── deterministic hash (matches C++ fasttext/sent2vec exactly) ────────────────
 
-_FNV_OFFSET_32 = 2166136261
-_FNV_PRIME_32  = 16777619
-_MASK32        = 0xFFFFFFFF
+@njit(cache=True)
+def _fnv1a_bytes(data):
+    """FNV-1a 32-bit over a uint8 array with signed-char XOR.
+    Identical to C++ Dictionary::hash()."""
+    h = np.uint32(2166136261)
+    for i in range(len(data)):
+        b = data[i]
+        # C++ does: h ^ uint32_t(int8_t(c)) — sign-extends bytes >= 0x80
+        sb = np.uint32(b) if b < 128 else np.uint32(np.int32(np.int8(b)))
+        h = (h ^ sb) * np.uint32(16777619)
+    # return as signed int32 to match C++ int32_t storage
+    return np.int32(h)
 
 def _fnv1a(s: str) -> int:
-    """FNV-1a 32-bit with signed-char XOR — identical to the C++ implementation."""
-    h = _FNV_OFFSET_32
-    for b in s.encode("utf-8"):
-        # C++ does: h ^ uint32_t(int8_t(c)) — sign-extends bytes >= 0x80
-        h = ((h ^ (b if b < 128 else b - 256) & _MASK32) * _FNV_PRIME_32) & _MASK32
-    # Return as signed int32 to match C++ int32_t storage
-    return h if h < 0x80000000 else h - 0x100000000
+    """FNV-1a 32-bit — thin wrapper that encodes str to bytes then calls numba."""
+    return int(_fnv1a_bytes(np.frombuffer(s.encode("utf-8"), dtype=np.uint8)))
 
 # ── numba kernels ────────────────────────────────────────────────────────────
 
@@ -241,8 +245,9 @@ class Vocab:
         words  = ["<PLACEHOLDER>"] + [w for w, c in freq.most_common() if c >= min_count]
         counts = np.array([0] + [freq[w] for w in words[1:]], dtype=np.int64)
         w2i    = {w: i for i, w in enumerate(words)}
-        # pre-hash every word once (instead of per-occurrence)
-        whash  = {w: _fnv1a(w) for w in words}
+        # pre-hash every word once — encode to bytes then call numba kernel
+        whash  = {w: int(_fnv1a_bytes(np.frombuffer(w.encode("utf-8"), dtype=np.uint8)))
+                  for w in words}
 
         if verbose > 0:
             print(f"\rRead {ntokens // 1_000_000}M words — "
@@ -354,7 +359,8 @@ class Sent2Vec:
         counts = d["counts"]
         m = d["meta"]
         fm = d["fmeta"]
-        whash = {w: _fnv1a(w) for w in words}
+        whash = {w: int(_fnv1a_bytes(np.frombuffer(w.encode("utf-8"), dtype=np.uint8)))
+                 for w in words}
         vocab = Vocab(
             words=words,
             counts=counts,

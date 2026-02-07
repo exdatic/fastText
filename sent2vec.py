@@ -12,7 +12,7 @@ Requires only **numpy** and **numba** (no C compiler, no scipy).
 
 from __future__ import annotations
 
-import argparse, math, sys, time
+import argparse, math, struct, sys, time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +34,19 @@ def _make_tables():
     return sig, log
 
 _SIG, _LOG = _make_tables()
+
+# ── deterministic hash ───────────────────────────────────────────────────────
+
+_FNV_OFFSET = 0xcbf29ce484222325
+_FNV_PRIME  = 0x00000100000001B3
+_MASK64     = 0xFFFFFFFFFFFFFFFF
+
+def _fnv1a(s: str) -> int:
+    """FNV-1a 64-bit hash — deterministic across processes, unlike hash()."""
+    h = _FNV_OFFSET
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * _FNV_PRIME) & _MASK64
+    return h
 
 # ── numba kernels ────────────────────────────────────────────────────────────
 
@@ -158,7 +171,7 @@ class Vocab:
             wid = self.w2i.get(tok, -1)
             if wid >= 0:
                 ids.append(wid)
-                hashes.append(hash(tok) & 0xFFFFFFFFFFFFFFFF)
+                hashes.append(_fnv1a(tok))
         return ids, hashes
 
     def word_ngram_ids(self, hashes: list[int], *, drop: set[int] | None = None

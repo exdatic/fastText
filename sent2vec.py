@@ -469,22 +469,18 @@ class Sent2Vec:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _build_neg_table(counts: np.ndarray, size: int = 10_000_000) -> np.ndarray:
-    """Build negative-sampling table. Uses repeat instead of searchsorted."""
+def _build_neg_table(counts: np.ndarray) -> np.ndarray:
+    """Build negative-sampling table, sized proportionally to vocab."""
     sqrt_c = np.sqrt(counts.astype(np.float64))
     prob = sqrt_c / sqrt_c.sum()
-    # allocate each word a number of slots proportional to sqrt(count)
+    # scale table to vocab: at least 1000 slots per word, capped at 10M
+    size = int(min(max(len(counts) * 1000, 100_000), 10_000_000))
     slots = np.maximum((prob * size).astype(np.int64), 1)
-    # adjust to hit exactly `size`
     diff = size - slots.sum()
-    if diff > 0:
+    if diff != 0:
         slots[np.argmax(prob)] += diff
-    elif diff < 0:
-        idx = np.argmax(prob)
-        slots[idx] = max(1, slots[idx] + diff)
     table = np.repeat(np.arange(len(counts), dtype=np.int32) + 1, slots.astype(np.intp))
-    return table[:size] if len(table) >= size else np.pad(table, (0, size - len(table)),
-                                                          constant_values=table[-1])
+    return table[:size]
 
 def _progress(tok, total, t0, lr, loss, n):
     pct = tok / total * 100
